@@ -793,7 +793,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       codex_thread_sandbox: "workspace-write",
       codex_turn_sandbox_policy: %{
         type: "workspaceWrite",
-        writableRoots: [explicit_workspace, explicit_cache]
+        writableRoots: [explicit_cache]
       }
     )
 
@@ -1138,7 +1138,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert runtime_settings.turn_sandbox_policy == %{
                "type" => "workspaceWrite",
-               "writableRoots" => ["relative/path"],
+               "writableRoots" => [issue_workspace, "relative/path"],
                "networkAccess" => true
              }
 

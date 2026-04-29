@@ -7,6 +7,7 @@ defmodule SymphonyElixir.CoreTest do
     @impl true
     def run(role, workspace, prompt, issue, opts) do
       send(Keyword.fetch!(opts, :test_pid), {:coding_agent_adapter_run, role, workspace, prompt, issue.identifier})
+      maybe_write_autonomous_review(prompt, opts)
       {:ok, %{session_id: "fake-session", thread_id: "fake-thread"}}
     end
 
@@ -26,6 +27,26 @@ defmodule SymphonyElixir.CoreTest do
     def stop_session(role, session, opts) do
       send(Keyword.fetch!(opts, :test_pid), {:coding_agent_stop_session, role, session.thread_id})
       :ok
+    end
+
+    defp maybe_write_autonomous_review(prompt, opts) do
+      case Regex.run(~r/Write exactly this JSON object to ([^,\n]+),/, prompt) do
+        [_match, output_path] ->
+          File.mkdir_p!(Path.dirname(output_path))
+
+          File.write!(
+            output_path,
+            Jason.encode!(%{
+              verdict: Keyword.get(opts, :review_verdict, "pass"),
+              summary: Keyword.get(opts, :review_summary, "fake autonomous review"),
+              head_sha: Keyword.get(opts, :review_head_sha, "abc123"),
+              findings: Keyword.get(opts, :review_findings, [])
+            })
+          )
+
+        _ ->
+          :ok
+      end
     end
   end
 
@@ -312,6 +333,90 @@ defmodule SymphonyElixir.CoreTest do
 
     assert [%{"run_id" => "run-review", "verdict" => "pass", "stale" => 0} | _] =
              SymphonyElixir.Storage.list_autonomous_reviews()
+  end
+
+  test "autonomous review runs a reviewer agent and publishes the check/review" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-autonomous-review-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "github",
+        tracker_owner: "devp1",
+        tracker_repo: "Beacon",
+        github_builder_token: "builder-token",
+        github_reviewer_token: "reviewer-token"
+      )
+
+      issue = %Issue{
+        id: "25",
+        identifier: "GH-25",
+        title: "Review me",
+        state: "Human Review",
+        repo_id: "beacon",
+        repo_owner: "devp1",
+        repo_name: "Beacon",
+        number: 25,
+        pr_url: "https://github.com/devp1/Beacon/pull/25",
+        pr_number: 25,
+        pr_state: "OPEN",
+        head_sha: "abc123",
+        check_state: "passing"
+      }
+
+      parent = self()
+
+      Application.put_env(:symphony_elixir, :github_command_fun, fn args, env ->
+        send(parent, {:gh_args, args, env})
+        {Jason.encode!(%{"id" => 123}), 0}
+      end)
+
+      on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
+
+      assert {:ok, review} =
+               SymphonyElixir.AutonomousReview.review_and_publish(workspace, issue,
+                 adapter: FakeCodingAgentAdapter,
+                 test_pid: self(),
+                 review_verdict: "request_changes",
+                 review_summary: "Needs a fix",
+                 review_findings: [%{title: "Bug", body: "Fix the edge case."}]
+               )
+
+      assert review.verdict == "request_changes"
+      assert review.summary == "Needs a fix"
+      assert review.head_sha == "abc123"
+      assert File.regular?(review.output_path)
+
+      assert_receive {:coding_agent_adapter_run, :reviewer, ^workspace, prompt, "GH-25-autonomous-review"}
+      assert prompt =~ "Autonomous PR review contract"
+      assert prompt =~ "https://github.com/devp1/Beacon/pull/25"
+
+      assert_received {:gh_args, check_args, [{"GH_TOKEN", "reviewer-token"}, {"GITHUB_TOKEN", "reviewer-token"}]}
+      assert ["api", "repos/devp1/Beacon/check-runs" | _] = check_args
+      assert "conclusion=failure" in check_args
+
+      assert_received {:gh_args, review_args, [{"GH_TOKEN", "reviewer-token"}, {"GITHUB_TOKEN", "reviewer-token"}]}
+      assert ["api", "repos/devp1/Beacon/pulls/25/reviews" | _] = review_args
+      assert "event=REQUEST_CHANGES" in review_args
+
+      assert [
+               %{
+                 "verdict" => "request_changes",
+                 "summary" => "Needs a fix",
+                 "head_sha" => "abc123",
+                 "check_conclusion" => "failure",
+                 "stale" => 0
+               }
+               | _
+             ] = SymphonyElixir.Storage.list_autonomous_reviews()
+    after
+      File.rm_rf(workspace)
+    end
   end
 
   test "handoff parser normalizes evidence metadata" do

@@ -11,7 +11,7 @@ defmodule SymphonyElixir.IssueSession do
   use GenServer
   require Logger
 
-  alias SymphonyElixir.{CodingAgent, Config, Evidence, Handoff, Linear.Issue, PromptBuilder}
+  alias SymphonyElixir.{AutonomousReview, CodingAgent, Config, Evidence, Handoff, Linear.Issue, PromptBuilder}
   alias SymphonyElixir.{Storage, Tracker, Workpad, Workspace}
 
   @type worker_host :: String.t() | nil
@@ -500,6 +500,7 @@ defmodule SymphonyElixir.IssueSession do
       })
 
     with {:ok, state} <- maybe_gate_human_review_handoff(state, handoff, target_state, payload),
+         {:ok, state} <- maybe_run_autonomous_pr_review_handoff(state, handoff, target_state, payload),
          :ok <- Tracker.update_issue_state(issue_id, target_state),
          {:ok, refreshed_issue} <- fetch_single_issue_state(state),
          :ok <- verify_handoff_state(refreshed_issue, target_state) do
@@ -607,6 +608,234 @@ defmodule SymphonyElixir.IssueSession do
   end
 
   defp maybe_gate_human_review_handoff(state, _handoff, _target_state, _payload), do: {:ok, state}
+
+  defp maybe_run_autonomous_pr_review_handoff(state, handoff, "Human Review", payload) do
+    issue = issue_with_handoff_pr(state.issue, handoff)
+
+    cond do
+      Config.settings!().tracker.kind != "github" ->
+        {:ok, state}
+
+      not reviewable_pr?(issue) ->
+        _ =
+          Storage.append_event(state.run_id, "info", "autonomous review skipped", %{
+            issue_session_id: state.issue_session_id,
+            reason: "missing-pr",
+            handoff: payload
+          })
+
+        {:ok, state}
+
+      not Config.independent_github_reviewer?() ->
+        _ =
+          Storage.append_event(state.run_id, "info", "autonomous review skipped", %{
+            issue_session_id: state.issue_session_id,
+            reason: "missing-independent-reviewer-token",
+            handoff: payload
+          })
+
+        {:ok, %{state | issue: issue}}
+
+      true ->
+        run_autonomous_pr_review(%{state | issue: issue}, handoff)
+    end
+  end
+
+  defp maybe_run_autonomous_pr_review_handoff(state, _handoff, _target_state, _payload), do: {:ok, state}
+
+  defp run_autonomous_pr_review(state, handoff) do
+    review_runner =
+      Keyword.get(state.opts, :autonomous_review_runner, fn workspace, issue ->
+        AutonomousReview.review_and_publish(workspace, issue,
+          run_id: state.run_id,
+          issue_session_id: state.issue_session_id
+        )
+      end)
+
+    case review_runner.(state.workspace, state.issue) do
+      {:ok, review} ->
+        handle_autonomous_review_result(state, handoff, review)
+
+      {:error, reason} ->
+        review = %{
+          verdict: "needs_input",
+          summary: "Autonomous PR review failed to complete",
+          findings: [%{reason: inspect(reason)}]
+        }
+
+        report_autonomous_review_needs_input(state, handoff, review, reason)
+    end
+  end
+
+  defp handle_autonomous_review_result(state, handoff, review) do
+    verdict = AutonomousReview.normalize_verdict(review_value(review, :verdict) || "needs_input")
+
+    case verdict do
+      "pass" ->
+        _ =
+          Storage.append_event(state.run_id, "info", "autonomous review passed", %{
+            issue_session_id: state.issue_session_id,
+            verdict: verdict,
+            summary: review_value(review, :summary),
+            output_path: review_value(review, :output_path)
+          })
+
+        {:ok, state}
+
+      "request_changes" ->
+        handle_autonomous_review_rework(state, handoff, review, :autonomous_review_requested_changes)
+
+      "needs_input" ->
+        report_autonomous_review_needs_input(state, handoff, review, :autonomous_review_needs_input)
+    end
+  end
+
+  defp handle_autonomous_review_rework(state, handoff, review, reason) do
+    _ =
+      Storage.append_event(state.run_id, "warning", "autonomous review requested changes", %{
+        issue_session_id: state.issue_session_id,
+        verdict: review_value(review, :verdict),
+        summary: review_value(review, :summary),
+        output_path: review_value(review, :output_path),
+        reason: inspect(reason)
+      })
+
+    prompt = autonomous_review_feedback_prompt(state.issue, handoff, review, reason)
+    _ = write_autonomous_review_feedback_file(state.workspace, review, reason)
+    _ = remove_handoff_marker(state)
+    {:continue_with_prompt, state, prompt}
+  end
+
+  defp autonomous_review_feedback_prompt(%Issue{} = issue, handoff, review, reason) do
+    """
+    Autonomous PR review feedback:
+
+    - Issue: #{issue.identifier || issue.id} — #{issue.title}
+    - PR URL, if known: #{issue.pr_url || Map.get(handoff, :pr_url) || "unknown"}
+    - Verdict: #{review_value(review, :verdict) || "request_changes"}
+    - Summary: #{review_value(review, :summary) || inspect(reason)}
+
+    The independent autonomous reviewer requested changes before the issue could park at human-review.
+    Continue in this same durable executor thread. Inspect `.symphony/autonomous-reviews/review-feedback.md`, the PR diff, checks, comments, and the issue acceptance criteria. Fix the implementation or evidence as needed.
+
+    When the PR is genuinely ready again, push the branch if needed and write a fresh `.symphony/handoff.json` with `ready: true`, `state: "human-review"`, `pr_url`, and current validation/evidence metadata.
+    """
+  end
+
+  defp write_autonomous_review_feedback_file(workspace, review, reason) when is_binary(workspace) do
+    feedback_path = Path.join([workspace, ".symphony", "autonomous-reviews", "review-feedback.md"])
+
+    :ok = File.mkdir_p(Path.dirname(feedback_path))
+
+    File.write(feedback_path, """
+    # Symphony Autonomous PR Review
+
+    The PR-ready handoff did not pass autonomous review.
+
+    Summary:
+    #{review_value(review, :summary) || inspect(reason)}
+
+    Raw review:
+    ```json
+    #{Jason.encode!(review, pretty: true)}
+    ```
+    """)
+  end
+
+  defp write_autonomous_review_feedback_file(_workspace, _review, _reason), do: :ok
+
+  defp report_autonomous_review_needs_input(%{issue: %Issue{id: issue_id}} = state, handoff, review, reason)
+       when is_binary(issue_id) do
+    _ =
+      Storage.append_event(state.run_id, "warning", "autonomous review needs input", %{
+        issue_session_id: state.issue_session_id,
+        verdict: review_value(review, :verdict) || "needs_input",
+        summary: review_value(review, :summary),
+        output_path: review_value(review, :output_path),
+        reason: inspect(reason)
+      })
+
+    comment =
+      autonomous_review_needs_input_comment(state, handoff, review, reason)
+
+    comment_result = Tracker.create_comment(issue_id, comment)
+    state_result = Tracker.update_issue_state(issue_id, "Needs Input")
+
+    case {comment_result, state_result} do
+      {:ok, :ok} ->
+        refreshed_issue =
+          case fetch_single_issue_state(state) do
+            {:ok, issue} -> issue
+            _ -> %{state.issue | state: "Needs Input"}
+          end
+
+        {:stop, %{state | issue: refreshed_issue}, :needs_input}
+
+      {comment_error, state_error} ->
+        errors = %{comment_result: comment_error, state_result: state_error}
+
+        {:error, {:autonomous_review_needs_input_report_failed, errors}}
+    end
+  end
+
+  defp report_autonomous_review_needs_input(state, _handoff, _review, reason) do
+    {:error, {:autonomous_review_failed, reason, state.issue}}
+  end
+
+  defp autonomous_review_needs_input_comment(state, handoff, review, reason) do
+    """
+    ## Symphony autonomous review needs input
+
+    Symphony kept this executor session autonomous through PR handoff, but the autonomous PR review could not produce a passing verdict.
+
+    - Issue: `#{state.issue.identifier || state.issue.id}`
+    - Run: `#{state.run_id || "unknown"}`
+    - Issue session: `#{state.issue_session_id || "unknown"}`
+    - Workspace: `#{state.workspace || "unknown"}`
+    - PR: `#{state.issue.pr_url || Map.get(handoff, :pr_url) || "unknown"}`
+    - Review verdict: `#{review_value(review, :verdict) || "needs_input"}`
+    - Summary: #{review_value(review, :summary) || inspect(reason)}
+
+    The issue was moved to `needs-input` so an operator can inspect the workspace, PR, review artifact, and GitHub credentials.
+    """
+  end
+
+  defp issue_with_handoff_pr(%Issue{} = issue, handoff) when is_map(handoff) do
+    pr_url = first_present(issue.pr_url, Map.get(handoff, :pr_url))
+
+    %{issue | pr_url: pr_url, pr_number: issue.pr_number || pr_number_from_url(pr_url)}
+  end
+
+  defp reviewable_pr?(%Issue{pr_url: pr_url, pr_number: pr_number}) do
+    (is_binary(pr_url) and String.trim(pr_url) != "") or not is_nil(pr_number)
+  end
+
+  defp pr_number_from_url(pr_url) when is_binary(pr_url) do
+    case Regex.run(~r{/pull/(\d+)(?:\z|[/?#])}, pr_url) do
+      [_match, number] -> String.to_integer(number)
+      _ -> nil
+    end
+  end
+
+  defp pr_number_from_url(_pr_url), do: nil
+
+  defp first_present(left, right) when is_binary(left) do
+    if String.trim(left) == "", do: first_present(nil, right), else: left
+  end
+
+  defp first_present(_left, right) when is_binary(right) do
+    if String.trim(right) == "", do: nil, else: right
+  end
+
+  defp first_present(left, right), do: left || right
+
+  defp review_value(%{} = review, key) do
+    Map.get(review, key) || Map.get(review, Atom.to_string(key))
+  rescue
+    ArgumentError -> Map.get(review, key)
+  end
+
+  defp review_value(_review, _key), do: nil
 
   defp run_blocking_evidence_gate(state, handoff, decision, bundle_id, attempt) do
     case Evidence.load_bundle(state.workspace, decision) do

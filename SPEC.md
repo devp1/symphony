@@ -960,6 +960,10 @@ Part E: Autonomous PR review and merge gate
 - The reviewer identity SHOULD be independent from the builder identity. In GitHub mode this is
   represented by separate builder and reviewer App tokens. Symphony MUST NOT hand those private
   credentials to executor or reviewer agents; Symphony owns GitHub writes.
+- Local GitHub implementations SHOULD run this review before parking a durable session at
+  `human-review` when an independent reviewer token is configured. If that identity is absent,
+  Symphony SHOULD record that the gate was skipped rather than publishing a verdict under the
+  builder or operator identity.
 - A reviewer `pass` MAY publish the `symphony/autonomous-review` check as `success`;
   `request_changes` publishes `failure`; `needs_input` publishes `action_required`.
 - Symphony SHOULD refuse pass-style PR approvals when the configured reviewer token is missing or

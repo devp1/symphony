@@ -173,14 +173,14 @@ defmodule SymphonyElixir.GitHub.AppAuth do
       "-X",
       "POST",
       "-H",
+      "Authorization: Bearer #{jwt}",
+      "-H",
       "Accept: application/vnd.github+json",
       "-H",
       "X-GitHub-Api-Version: 2022-11-28"
     ]
 
-    env = [{"GH_TOKEN", jwt}, {"GITHUB_TOKEN", jwt}]
-
-    case run_command(command_fun, args, env) do
+    case run_command(command_fun, args, []) do
       {output, 0} ->
         parse_installation_token(output)
 

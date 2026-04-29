@@ -1,9 +1,6 @@
 {
   "name": "devp1-symphony-reviewer",
   "url": "https://github.com/devp1/symphony",
-  "hook_attributes": {
-    "url": "http://127.0.0.1:4001/github/reviewer-app/webhook"
-  },
   "redirect_url": "http://127.0.0.1:4001/github/reviewer-app/manifest",
   "public": false,
   "default_permissions": {

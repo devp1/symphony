@@ -442,8 +442,10 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert [{"GH_TOKEN", "reviewer-installation-token"}, {"GITHUB_TOKEN", "reviewer-installation-token"}] =
              GitHubClient.command_env_for_test(:reviewer)
 
-    assert_receive {:mint_args, ["api", "app/installations/200/access_tokens" | _], [{"GH_TOKEN", builder_jwt}, {"GITHUB_TOKEN", builder_jwt}]}
-    assert_receive {:mint_args, ["api", "app/installations/201/access_tokens" | _], [{"GH_TOKEN", reviewer_jwt}, {"GITHUB_TOKEN", reviewer_jwt}]}
+    assert_receive {:mint_args, ["api", "app/installations/200/access_tokens" | builder_args], []}
+    assert_receive {:mint_args, ["api", "app/installations/201/access_tokens" | reviewer_args], []}
+    builder_jwt = bearer_jwt_from_args(builder_args)
+    reviewer_jwt = bearer_jwt_from_args(reviewer_args)
     assert builder_jwt =~ "."
     assert reviewer_jwt =~ "."
   end
@@ -619,6 +621,15 @@ defmodule SymphonyElixir.GitHubClientTest do
                        "DELETE",
                        "--silent"
                      ]}
+  end
+
+  defp bearer_jwt_from_args(args) do
+    args
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.find_value(fn
+      ["-H", "Authorization: Bearer " <> jwt] -> jwt
+      _other -> nil
+    end)
   end
 
   defp test_private_key_pem do

@@ -3,6 +3,14 @@
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 
+This fork's local trusted path treats Symphony as a durable coding-agent session controller: the
+executor keeps full repo access, while optional evidence bundles can be reviewed by a separate
+review agent before the issue parks at human review. The GitHub cockpit path also separates builder
+and reviewer identities so autonomous review checks can gate merge readiness without handing App
+credentials to the coding agents. Codex app-server is the first/default adapter; the controller
+contract is intentionally phrased around coding agents so other local agents can be added without
+changing the lifecycle model.
+
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](.github/media/symphony-demo.mp4)
 
 _In this [demo video](.github/media/symphony-demo.mp4), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._

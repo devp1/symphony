@@ -731,6 +731,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       codex_thread_sandbox: nil,
       codex_turn_sandbox_policy: nil,
       codex_turn_timeout_ms: nil,
+      codex_semantic_inactivity_timeout_ms: nil,
       codex_read_timeout_ms: nil,
       codex_stall_timeout_ms: nil,
       tracker_api_token: nil,
@@ -769,6 +770,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            }
 
     assert config.codex.turn_timeout_ms == 3_600_000
+    assert config.codex.semantic_inactivity_timeout_ms == 1_800_000
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
 
@@ -825,6 +827,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_turn_timeout_ms: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.turn_timeout_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_semantic_inactivity_timeout_ms: "bad")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.semantic_inactivity_timeout_ms"
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_read_timeout_ms: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()

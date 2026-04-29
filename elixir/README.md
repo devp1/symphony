@@ -13,35 +13,46 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls Linear for candidate work
+1. Polls GitHub Issues for candidate work across configured repositories
 2. Creates a workspace per issue
-3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
-   workspace
-4. Sends a workflow prompt to Codex
-5. Keeps Codex working on the issue until the work is done
+3. Launches the configured coding-agent adapter inside the workspace. The current default adapter is
+   Codex in [App Server mode](https://developers.openai.com/codex/app-server/).
+4. Sends a workflow prompt to the coding agent
+5. Keeps the agent working on the issue until it produces a PR-ready handoff or reaches a real
+   blocker
 
-During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
-skills can make raw Linear GraphQL calls.
+The local Phoenix cockpit shows configured repos, GitHub issue label states, active Codex sessions,
+SQLite-backed run history, token usage, and evidence/PR handoff metadata.
 
-If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
-Symphony stops the active agent for that issue and cleans up matching workspaces.
+For `runtime_profile: local_trusted` GitHub runs, Symphony keeps one durable Codex issue session
+alive across implementation, PR handoff parking at `human-review`, and later `rework`. Runs remain
+per-active-cycle audit records; the issue session is the durable collaborator identity.
+Workers also write a local `.symphony/handoff.json` marker before final handoff. Symphony treats
+that file as a controller-actionable signal, applies the requested GitHub label transition itself,
+and verifies the refreshed issue state before parking or stopping the session. In local trusted
+runs, Symphony watches for a ready marker during an active turn and interrupts that turn through
+Codex app-server `turn/interrupt` so the durable thread parks cleanly after handoff instead of
+drifting into more work.
+If the handoff requests `human-review` with required evidence, Symphony runs a separate review-agent
+turn through the same coding-agent adapter boundary before applying the label. Missing or failed
+evidence is fed back into the same executor thread; after the configured attempt budget, the issue
+moves to `needs-input` for operator inspection.
+
+If a claimed issue moves to a terminal state (`Done`), Symphony stops the active agent for that
+issue and cleans up matching workspaces.
 
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see
    [Harness engineering](https://openai.com/index/harness-engineering/).
-2. Get a new personal token in Linear via Settings → Security & access → Personal API keys, and
-   set it as the `LINEAR_API_KEY` environment variable.
+2. Authenticate the GitHub CLI (`gh auth status`) for the repos Symphony will manage.
 3. Copy this directory's `WORKFLOW.md` to your repo.
-4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
-   - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
-     operations such as comment editing or upload flows.
+4. Optionally copy the `commit`, `push`, `pull`, and `land` skills to your repo.
 5. Customize the copied `WORKFLOW.md` file for your project.
-   - To get your project's slug, right-click the project and copy its URL. The slug is part of the
-     URL.
-   - When creating a workflow based on this repo, note that it depends on non-standard Linear
-     issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
-     Team Settings → Workflow in Linear.
+   - Configure `repos:` with GitHub `owner`, `name`, optional `id`, optional `clone_url`, and
+     optional label overrides.
+   - The default GitHub label state machine is `agent-ready`, `in-progress`, `human-review`,
+     `needs-input`, `blocked`, `rework`, `merging`, plus the managed label `symphony`.
 6. Follow the instructions below to install the required runtime dependencies and start the service.
 
 ## Prerequisites
@@ -65,6 +76,12 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+After changing Elixir source, run `mise exec -- mix build` again before dogfooding
+`./bin/symphony`. The checked-in escript is static, and the CLI refuses to start
+from a source checkout when runtime source files are newer than `bin/symphony`.
+Use `--allow-stale-binary` only for deliberate debugging of an older packaged
+binary.
+
 ## Configuration
 
 Pass a custom workflow file path to `./bin/symphony` when starting the service:
@@ -77,6 +94,8 @@ If no path is passed, Symphony defaults to `./WORKFLOW.md`.
 
 Optional flags:
 
+- `--allow-stale-binary` bypasses the source-vs-escript freshness guard. This
+  should be rare; normal local dogfood should rebuild with `mise exec -- mix build`.
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
 
@@ -88,21 +107,52 @@ Minimal example:
 ```md
 ---
 tracker:
-  kind: linear
-  project_slug: "..."
+  kind: github
+  owner: devp1
+  repo: Beacon
+github:
+  builder_token: $SYMPHONY_GITHUB_BUILDER_TOKEN
+  reviewer_token: $SYMPHONY_GITHUB_REVIEWER_TOKEN
+  review_check_name: symphony/autonomous-review
+  required_check_names: []
+repos:
+  - id: beacon
+    owner: devp1
+    name: Beacon
+    clone_url: https://github.com/devp1/Beacon.git
 workspace:
   root: ~/code/workspaces
 hooks:
   after_create: |
-    git clone git@github.com:your-org/your-repo.git .
+    git clone https://github.com/devp1/Beacon.git .
+  before_run: |
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      safe_name="$(printf '%s' "$(basename "$PWD")" | tr -c 'A-Za-z0-9._-' '-')"
+      branch="codex/${safe_name:-issue}"
+      git switch "$branch" 2>/dev/null || git switch -c "$branch"
+    fi
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  artifact_nudge_tokens: 250000
+  max_artifact_nudges: 2
+  max_tokens_before_first_artifact: 300000
+  max_tokens_without_artifact: 750000
+evidence:
+  enabled: true
+  review_gate: blocking
+  force_labels: [evidence-required]
+  skip_labels: [evidence-skip]
+  max_review_attempts: 2
 codex:
-  command: codex app-server
+  command: codex --config shell_environment_policy.inherit=all app-server
+  approval_policy: never
+  semantic_inactivity_timeout_ms: 1800000
+storage:
+  sqlite_path: ./symphony.sqlite3
 ---
 
-You are working on a Linear issue {{ issue.identifier }}.
+You are working on a GitHub issue {{ issue.identifier }}.
 
 Title: {{ issue.title }} Body: {{ issue.description }}
 ```
@@ -110,24 +160,92 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- `github.builder_token` and `github.reviewer_token` are optional `$VAR` token references for
+  separate GitHub App identities. The builder identity owns issue labels/comments, branches, PR
+  creation, and normal worker handoff. The reviewer identity owns autonomous PR review checks and
+  PR review comments/approvals. Tokens stay in Symphony config/runtime env; executor/reviewer
+  agents do not receive private keys.
+- `github.review_check_name` defaults to `symphony/autonomous-review`. Symphony records autonomous
+  reviewer verdicts in SQLite and can publish a GitHub check with conclusion `success`,
+  `failure`, or `action_required` for `pass`, `request_changes`, or `needs_input`.
+- Symphony refuses pass-style PR approvals unless the configured reviewer token is present and
+  distinct from the builder token. For Symphony-authored PRs, failed autonomous review routes back
+  to the executor/rework path instead of letting the reviewer push fixes to the builder branch.
+- `runtime_profile` defaults to `default`. Set `runtime_profile: local_trusted` only for trusted
+  local dogfood runs that need Codex workers to push branches, open PRs, and comment on GitHub; it
+  runs local Codex sessions with `danger-full-access` so Git handoff is not blocked by sandboxed
+  `.git` writes. Remote workers stay workspace-scoped.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
-- When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
-  unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
-  Symphony validation.
+- When `codex.turn_sandbox_policy` is set explicitly, Symphony normally passes the map through to
+  Codex unchanged. With `runtime_profile: local_trusted`, omitted local turn policy resolves to
+  `{"type":"dangerFullAccess"}`. Explicit `dangerFullAccess` stays minimal; explicit workspace
+  policies still force network access and include the issue workspace in `writableRoots`.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
-  invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+  active work cycle when a turn completes normally but the issue is still in an active state.
+  Default: `20`. Local trusted sessions park at that boundary and can resume the same thread.
+- `.symphony/handoff.json` is the machine-readable worker handoff marker. It is runtime state and
+  must not be committed. The supported final states are `human-review`, `needs-input`, `blocked`,
+  and `done`; Symphony maps those to the configured tracker labels/state and verifies the result.
+  Stale handoff markers are cleared at the start of each active local work cycle, so rework must
+  write a fresh marker when it becomes review-ready again.
+- For `human-review`, workers may include an `evidence` object in the handoff marker:
+  `{"required": true, "bundle_path": ".symphony/evidence/<run>/manifest.json", "reason": "UI changed"}`.
+  In the default blocking gate, Symphony records the bundle, runs a review-agent turn through the
+  coding-agent adapter with full repo read/network access and write access only to its review
+  artifact, and only then applies `human-review`. Failed or missing evidence creates
+  `.symphony/evidence/review-feedback.md`, removes the stale handoff marker, and prompts the same
+  executor thread to fix the work or evidence.
+- Required evidence manifests use `schema_version: "symphony.evidence.v1"`, a non-empty `summary`,
+  and at least one inspectable `artifacts` or `commands` entry. Local artifact/log paths resolve
+  from the manifest directory, must exist, and must stay inside the issue workspace. `http://` and
+  `https://` URLs are allowed for externally hosted artifacts. Artifact `kind` values are flexible
+  so agents can add new proof types without controller changes.
+- `evidence.enabled`, `evidence.review_gate`, `evidence.force_labels`, `evidence.skip_labels`, and
+  `evidence.max_review_attempts` configure that gate. `review_gate: advisory` records evidence
+  metadata without blocking handoff; `review_gate: off` disables it.
+- `agent.artifact_nudge_tokens`, `agent.max_tokens_before_first_artifact`, and
+  `agent.max_tokens_without_artifact` are advisory health budgets for local trusted durable
+  sessions. When crossed, Symphony records `stale-proof` or `high-token-no-proof` warnings in the
+  SQLite ledger/API/dashboard, but it does not terminate Codex.
+- These token totals are observability counters, not cost counters. Upstream prompt caching can make
+  repeated input-prefix tokens cheaper and faster, but output/reasoning and dynamic command/GitHub
+  output still represent real runtime and context churn. Large no-artifact or post-handoff token
+  spends should be treated as workflow/prompt issues even when cached input lowers cost.
+- `codex.semantic_inactivity_timeout_ms` defaults to `1800000` (30 minutes). It is the hard
+  stuck-run guard for local trusted sessions: Symphony resets it only on meaningful Codex activity
+  such as agent message deltas, command output, file-change output, MCP progress, tool calls,
+  approval handling, or turn lifecycle events.
+- Legacy and remote workers may still use those budgets for restart/pause behavior until durable
+  remote sessions are implemented.
+- Trusted local dogfood workflows can set larger warning budgets, for example `300000` before the
+  first artifact and `750000` after artifact progress starts.
+  The watchdog is a visibility surface for no-proof loops, not a substitute for Codex's own
+  judgment.
+- The workflow prompt should put the kickoff contract near the top: claim already done, verify the
+  issue branch, read the smallest useful context, produce one issue-relevant repo artifact before
+  broad exploration, then keep the durable issue workpad useful at natural checkpoints.
+- A `hooks.before_run` branch switch is recommended for GitHub repos so issue-branch setup is
+  Symphony-owned plumbing instead of Codex spending early tokens on it.
+- For unattended GitHub bookkeeping, prefer the authenticated `gh` CLI over GitHub MCP/app connector
+  tools. Connector elicitation requests are treated as human approval prompts so they do not silently
+  stall behind the artifact watchdog.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
-- `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+- `repos` is the first-class GitHub repository list for the cockpit and runner. If omitted,
+  `tracker.owner`/`tracker.repo` are used as a backward-compatible single repo.
+- `storage.sqlite_path` controls the local SQLite ledger used for run history, issue snapshots,
+  run events, artifacts, and Codex session metadata.
+- `tracker.api_key` reads from `LINEAR_API_KEY`, `GITHUB_TOKEN`, or `GH_TOKEN` when unset or when
+  value is an env reference. GitHub mode primarily uses the authenticated `gh` CLI.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -148,17 +266,32 @@ codex:
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
+- On startup, stale persisted run-ledger rows still marked `running` are changed to `cancelled`
+  with an interruption event, and stale persisted issue sessions are marked
+  `interrupted-resumable`. For local trusted sessions, the next dispatch reuses the preserved
+  workspace and attempts Codex `thread/resume`; if that fails, Symphony records a warning and starts
+  a fresh persisted thread.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+  `/`, `/api/v1/state`, `/api/v1/repos`, `/api/v1/issues`, `/api/v1/runs/:id`,
+  `/api/v1/runs/:run_id/cancel`, `/api/v1/issues/:repo_id/:number/rerun`,
+  `/api/v1/issues/:repo_id/:number/stop-session`, `/api/v1/<issue_identifier>`, and
+  `/api/v1/refresh`.
 
 ## Web dashboard
 
-The observability UI now runs on a minimal Phoenix stack:
+The cockpit UI runs on a minimal Phoenix stack:
 
-- LiveView for the dashboard at `/`
-- JSON API for operational debugging under `/api/v1/*`
+- LiveView for the GitHub cockpit at `/`
+- JSON API for operational debugging and runtime data under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
+
+The cockpit surfaces GitHub PR handoff metadata when available: PR URL, head SHA, check state, and
+review state. Active run rows include operator controls to request cancellation, rerun an issue, or
+stop a parked/running durable issue session. Those controls call the same JSON API used by tests;
+they are local trusted control-plane actions, not part of the worker prompt.
+Parked durable sessions are shown separately from active runs so `human-review` parking does not look
+like a failing or still-running worker.
 
 ## Project Layout
 
@@ -173,8 +306,9 @@ The observability UI now runs on a minimal Phoenix stack:
 make all
 ```
 
-Run the real external end-to-end test only when you want Symphony to create disposable Linear
-resources and launch a real `codex app-server` session:
+Run the real external end-to-end tests only when you want Symphony to touch live external systems
+and launch a real `codex app-server` session. The older live harness still exercises the legacy
+Linear path; the GitHub cockpit path should use disposable GitHub issues/PRs in a test repository.
 
 ```bash
 cd elixir
@@ -199,9 +333,11 @@ the transport representative without depending on long-lived external machines.
 
 Set `SYMPHONY_LIVE_SSH_WORKER_HOSTS` if you want `make e2e` to target real SSH hosts instead.
 
-The live test creates a temporary Linear project and issue, writes a temporary `WORKFLOW.md`, runs
-a real agent turn, verifies the workspace side effect, requires Codex to comment on and close the
-Linear issue, then marks the project completed so the run remains visible in Linear.
+The legacy live test creates a temporary Linear project and issue, writes a temporary `WORKFLOW.md`,
+runs a real agent turn, verifies the workspace side effect, requires Codex to comment on and close
+the Linear issue, then marks the project completed so the run remains visible in Linear. This is
+kept as compatibility coverage while the primary v1 product direction moves to GitHub Issues plus
+PR handoff.
 
 ## FAQ
 

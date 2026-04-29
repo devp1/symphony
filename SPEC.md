@@ -16,7 +16,7 @@ behavior.
 ## 1. Problem Statement
 
 Symphony is a long-running automation service that continuously reads work from an issue tracker
-(Linear in this specification version), creates an isolated workspace for each issue, and runs a
+(GitHub Issues in this implementation profile), creates an isolated workspace for each issue, and runs a
 coding agent session for that issue inside the workspace.
 
 The service solves four operational problems:
@@ -51,16 +51,20 @@ Important boundary:
 - Stop active runs when issue state changes make them ineligible.
 - Recover from transient failures with exponential backoff.
 - Load runtime behavior from a repository-owned `WORKFLOW.md` contract.
-- Expose operator-visible observability (at minimum structured logs).
-- Support tracker/filesystem-driven restart recovery without requiring a persistent database; exact
-  in-memory scheduler state is not restored.
+- Expose operator-visible observability and a local control surface for trusted operators.
+- Support tracker/filesystem-driven restart recovery. Implementations MAY also keep a local durable
+  run ledger for audit history and dashboard state.
+- For trusted local GitHub runs, keep a durable issue session alive across implementation, PR
+  handoff parking, and rework when the coding-agent protocol can support it.
+- Optionally gate PR-ready handoff with an agent-agnostic evidence bundle review so human reviewers
+  see proof artifacts and reviewer feedback before an issue parks at human review.
 
 ### 2.2 Non-Goals
 
-- Rich web UI or multi-tenant control plane.
-- Prescribing a specific dashboard or terminal UI implementation.
+- Public multi-tenant control plane.
+- Prescribing a separate frontend application outside the service runtime.
 - General-purpose workflow engine or distributed job scheduler.
-- Built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in the
+- Built-in business logic for how to edit issues, PRs, or comments. (That logic lives in the
   workflow prompt and agent tooling.)
 - Mandating strong sandbox controls beyond what the coding agent and host OS provide.
 - Mandating a single default approval, sandbox, or operator-confirmation posture for all
@@ -98,15 +102,22 @@ Important boundary:
    - Runs workspace lifecycle hooks.
    - Cleans workspaces for terminal issues.
 
-6. `Agent Runner`
+6. `Issue Session` / `Agent Runner`
    - Creates workspace.
    - Builds prompt from issue + workflow template.
-   - Launches the coding agent app-server client.
+   - Launches the coding agent through an adapter boundary. The reference implementation uses Codex
+     app-server first, but executor/reviewer contracts SHOULD remain agent-agnostic where practical.
    - Streams agent updates back to the orchestrator.
+   - In durable local profiles, owns one issue workspace, one app-server process, and one coding
+     agent thread across multiple active work cycles.
 
 7. `Status Surface` (OPTIONAL)
    - Presents human-readable runtime status (for example terminal output, dashboard, or other
      operator-facing view).
+   - SHOULD expose enough runtime identity to distinguish the running binary from the checkout,
+     such as implementation version, build/source SHA when available, workflow path, and config path.
+   - A checked-out static runtime binary SHOULD fail fast or warn loudly when runtime source files
+     are newer than the binary, so dogfood runs do not silently use stale orchestration behavior.
 
 8. `Logging`
    - Emits structured runtime logs to one or more configured sinks.
@@ -117,7 +128,7 @@ Symphony is easiest to port when kept in these layers:
 
 1. `Policy Layer` (repo-defined)
    - `WORKFLOW.md` prompt body.
-   - Team-specific rules for ticket handling, validation, and handoff.
+   - Team-specific rules for issue handling, validation, and handoff.
 
 2. `Configuration Layer` (typed getters)
    - Parses front matter into typed runtime settings.
@@ -129,7 +140,7 @@ Symphony is easiest to port when kept in these layers:
 4. `Execution Layer` (workspace + agent subprocess)
    - Filesystem lifecycle, workspace preparation, coding-agent protocol.
 
-5. `Integration Layer` (Linear adapter)
+5. `Integration Layer` (GitHub adapter)
    - API calls and normalization for tracker data.
 
 6. `Observability Layer` (logs + OPTIONAL status surface)
@@ -137,7 +148,7 @@ Symphony is easiest to port when kept in these layers:
 
 ### 3.3 External Dependencies
 
-- Issue tracker API (Linear for `tracker.kind: linear` in this specification version).
+- Issue tracker API (GitHub Issues for `tracker.kind: github` in this implementation profile).
 - Local filesystem for workspaces and logs.
 - OPTIONAL workspace population tooling (for example Git CLI, if used).
 - Coding-agent executable that supports the targeted Codex app-server mode.
@@ -156,7 +167,7 @@ Fields:
 - `id` (string)
   - Stable tracker-internal ID.
 - `identifier` (string)
-  - Human-readable ticket key (example: `ABC-123`).
+  - Human-readable issue key (example: `GH-123` or `repo-123`).
 - `title` (string)
 - `description` (string or null)
 - `priority` (integer or null)
@@ -221,8 +232,31 @@ Fields (logical):
 - `started_at`
 - `status`
 - `error` (OPTIONAL)
+- `issue_session_id` (string or null)
+  - Durable issue session identity when the implementation supports session continuity.
 
-#### 4.1.6 Live Session (Agent Session Metadata)
+#### 4.1.6 Issue Session
+
+Durable identity for one issue in implementations that keep a local coding-agent thread alive across
+multiple active work cycles.
+
+Fields (logical):
+
+- `id` (string)
+- `repo_id` (string)
+- `issue_number` (integer)
+- `issue_identifier` (string)
+- `workspace_path` (string)
+- `codex_thread_id` (string or null)
+- `app_server_pid` (string or null)
+- `state` (`starting`, `running`, `parked`, `stopped`, `failed`, or `interrupted`)
+- `current_run_id` (string or null)
+- `health` (list of advisory flags, for example `healthy`, `parked`, `stale-proof`,
+  `high-token-no-proof`, `handoff-lagging`, `needs-input`, `failed`)
+- `parked_at` (timestamp or null)
+- `stop_reason` (string or null)
+
+#### 4.1.7 Live Session (Agent Session Metadata)
 
 State tracked while a coding-agent subprocess is running.
 
@@ -244,7 +278,7 @@ Fields:
 - `turn_count` (integer)
   - Number of coding-agent turns started within the current worker lifetime.
 
-#### 4.1.7 Retry Entry
+#### 4.1.8 Retry Entry
 
 Scheduled retry state for an issue.
 
@@ -257,7 +291,7 @@ Fields:
 - `timer_handle` (runtime-specific timer reference)
 - `error` (string or null)
 
-#### 4.1.8 Orchestrator Runtime State
+#### 4.1.9 Orchestrator Runtime State
 
 Single authoritative in-memory state owned by the orchestrator.
 
@@ -349,7 +383,7 @@ Fields:
 
 - `kind` (string)
   - REQUIRED for dispatch.
-  - Current supported value: `linear`
+  - Current supported values: `github`, `linear`
 - `endpoint` (string)
   - Default for `tracker.kind == "linear"`: `https://api.linear.app/graphql`
 - `api_key` (string)
@@ -358,6 +392,11 @@ Fields:
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
 - `project_slug` (string)
   - REQUIRED for dispatch when `tracker.kind == "linear"`.
+- `owner` / `repo` (strings)
+  - Legacy single-repository GitHub configuration for `tracker.kind == "github"`.
+- `repos` (top-level list)
+  - Preferred GitHub configuration. Each entry includes `id`, `owner`, `name`, optional
+    `clone_url`, optional `workspace_root`, and optional label overrides.
 - `active_states` (list of strings)
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings)
@@ -419,6 +458,26 @@ Fields:
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
+- `artifact_nudge_tokens` (integer)
+  - Default: `250000`
+  - `0` disables autonomous repo-artifact nudges.
+  - Invalid negative values fail configuration validation.
+- `max_artifact_nudges` (integer)
+  - Default: `1`
+  - Caps how many no-repo-artifact continuation nudges Symphony may send before pause watchdogs take over.
+  - `0` disables autonomous repo-artifact nudges.
+  - Invalid negative values fail configuration validation.
+- `max_tokens_before_first_artifact` (integer)
+  - Default: `200000`
+  - `0` disables first-artifact watchdog enforcement.
+  - Invalid negative values fail configuration validation.
+- `max_tokens_without_artifact` (integer)
+  - Default: `250000`
+  - `0` disables standard artifact-watchdog enforcement.
+  - Invalid negative values fail configuration validation.
+  - Trusted local dogfood workflows MAY configure a larger value when the goal is fully
+    unattended long-horizon execution. The watchdog should catch no-proof loops, not prematurely
+    interrupt productive Codex work.
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
   - State keys are normalized (`lowercase`) for lookup.
@@ -448,6 +507,9 @@ fields locally if they want stricter startup checks.
   - Default: implementation-defined.
 - `turn_timeout_ms` (integer)
   - Default: `3600000` (1 hour)
+- `semantic_inactivity_timeout_ms` (integer)
+  - Default: `1800000` (30 minutes)
+  - Resets only on meaningful Codex activity, not token updates or generic narration.
 - `read_timeout_ms` (integer)
   - Default: `5000`
 - `stall_timeout_ms` (integer)
@@ -474,8 +536,8 @@ Template input variables:
 
 Fallback prompt behavior:
 
-- If the workflow prompt body is empty, the runtime MAY use a minimal default prompt
-  (`You are working on an issue from Linear.`).
+- If the workflow prompt body is empty, the runtime MAY use a minimal default prompt for the
+  configured tracker.
 - Workflow file read/parse failures are configuration/validation errors and SHOULD NOT silently fall
   back to a prompt.
 
@@ -563,6 +625,8 @@ Validation checks:
 - `tracker.api_key` is present after `$` resolution.
 - `tracker.project_slug` is present when REQUIRED by the selected tracker kind.
 - `codex.command` is present and non-empty.
+- For `tracker.kind=github`, the authenticated `gh` CLI can access GitHub and all configured
+  workflow labels exist before a worker is launched.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -570,10 +634,22 @@ This section is intentionally redundant so a coding agent can implement the conf
 Extension fields are documented in the extension section that defines them. Core conformance does
 not require recognizing or validating extension fields unless that extension is implemented.
 
-- `tracker.kind`: string, REQUIRED, currently `linear`
+- `tracker.kind`: string, REQUIRED, currently `github` or `linear`
+- `runtime_profile`: string, default `default`; `local_trusted` is an explicit local opt-in that
+  enables Codex turn-network access for trusted GitHub handoff runs while keeping writes rooted in
+  the issue workspace.
 - `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
 - `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
 - `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
+- `repos`: list of GitHub repository configs when `tracker.kind=github`; preferred over legacy
+  `tracker.owner` / `tracker.repo`
+- `github.builder_token`: optional string or `$VAR`; token for the GitHub builder identity that
+  owns issue labels/comments, branch updates, PR creation, and normal worker handoff
+- `github.reviewer_token`: optional string or `$VAR`; token for the independent GitHub reviewer
+  identity that owns autonomous review check runs, PR review comments, and approvals
+- `github.review_check_name`: string, default `symphony/autonomous-review`
+- `github.required_check_names`: list of strings, default `[]`; named CI checks the cockpit merge
+  gate may require in addition to the autonomous review check
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms`: integer, default `30000`
@@ -586,14 +662,27 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
+- `agent.artifact_nudge_tokens`: integer, default `250000`; `0` disables no-repo-artifact nudges
+- `agent.max_artifact_nudges`: integer, default `1`; `0` disables no-repo-artifact nudges
+- `agent.max_tokens_before_first_artifact`: integer, default `200000`; `0` disables the early watchdog
+- `agent.max_tokens_without_artifact`: integer, default `250000`; `0` disables the standard watchdog
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
 - `codex.turn_timeout_ms`: integer, default `3600000`
+- `codex.semantic_inactivity_timeout_ms`: integer, default `1800000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `evidence.enabled`: boolean, default `true`
+- `evidence.force_labels`: list of issue labels that require an evidence bundle, default
+  `["evidence-required"]`
+- `evidence.skip_labels`: list of issue labels that skip evidence review, default
+  `["evidence-skip"]`
+- `evidence.review_gate`: string, default `blocking`; supported values are `blocking`, `advisory`,
+  and `off`
+- `evidence.max_review_attempts`: integer, default `2`
 
 ## 7. Orchestration State Machine
 
@@ -690,7 +779,9 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - The orchestrator serializes state mutations through one authority to avoid duplicate dispatch.
 - `claimed` and `running` checks are REQUIRED before launching any worker.
 - Reconciliation runs before dispatch on every tick.
-- Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
+- Restart recovery is tracker-driven and filesystem-driven. If an implementation keeps a durable
+  run ledger, startup MUST reconcile stale persisted `running` rows so the ledger does not imply
+  live workers survived process restart.
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 
 ## 8. Polling, Scheduling, and Reconciliation
@@ -788,7 +879,45 @@ Part A: Stall detection
 - If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
 
-Part B: Tracker state refresh
+Part B: Artifact watchdog
+
+- Implementations MAY pause restart-style workers that spend too many tokens without inspectable
+  artifact progress.
+- For durable local trusted issue sessions, artifact thresholds SHOULD be advisory health warnings
+  (`stale-proof`, `high-token-no-proof`) rather than stop conditions. They MUST NOT terminate Codex
+  unless another hard-stop condition exists, such as input required, missing auth/secrets, process
+  failure, explicit cancellation, terminal tracker state, or stall timeout with no activity.
+- Before pausing legacy/restart-style workers, implementations MAY perform autonomous repo-artifact
+  nudges. A nudge terminates the current worker, preserves the issue workspace, and queues an
+  immediate continuation run with guidance to create the smallest issue-relevant repo artifact before
+  more broad discovery.
+- Nudge continuation guidance SHOULD include compact state from the interrupted run. The Elixir
+  implementation includes recent Codex activity and local workspace branch/head/status in the retry
+  prompt, and writes the same runtime-only capsule to `.symphony/continuation.json` for local
+  workspaces.
+- `agent.artifact_nudge_tokens` controls the token budget since the last repo artifact before a
+  nudge. Repo artifacts are stricter than general artifact markers and currently mean non-empty
+  Codex diff updates or local workspace git changes. `0` disables nudges.
+- `agent.max_artifact_nudges` caps nudge restarts before the pause watchdog is allowed to move the
+  issue to operator input. `0` disables nudges.
+- If implemented, `agent.max_tokens_before_first_artifact` controls the token budget before the
+  first artifact marker; `0` disables this early backstop.
+- If implemented, `agent.max_tokens_without_artifact` controls the token budget since the last
+  artifact marker after artifact progress has started; `0` disables the standard watchdog.
+- Before the first artifact, implementations SHOULD use the smaller positive value from
+  `max_tokens_before_first_artifact` and `max_tokens_without_artifact` so a stricter standard budget
+  still applies.
+- Artifact markers are implementation-defined and MUST be documented. The Elixir implementation
+  counts non-empty Codex diff updates, local workspace git changes, and updates to the local
+  `.symphony/workpad.md` run ledger or durable GitHub `## Codex Workpad` comment.
+- Operators MAY use larger thresholds for trusted local runs where Codex is expected to work
+  unattended through long implementation and validation arcs.
+- If the watchdog threshold is exceeded for a restart-style worker, terminate the worker, comment
+  with the pause reason and evidence, move the issue to an operator-input state, and do not
+  automatically retry. For durable local trusted sessions, record the warning in the ledger/API/UI
+  and keep the same session running.
+
+Part C: Tracker state refresh
 
 - Fetch current issue states for all running issue IDs.
 - For each running issue:
@@ -796,6 +925,50 @@ Part B: Tracker state refresh
   - If tracker state is still active: update the in-memory issue snapshot.
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
 - If state refresh fails, keep workers running and try again on the next tick.
+
+Part D: Evidence review gate
+
+- A worker MAY include an `evidence` object in `.symphony/handoff.json` before requesting
+  `human-review`. Implementations SHOULD treat this as executor-declared proof metadata, not as a
+  tracker transition by itself.
+- `evidence.required: true` means the executor believes an evidence bundle is needed. Label/config
+  overrides MAY force or skip evidence independent of the executor declaration.
+- An evidence bundle SHOULD include a JSON manifest path, normally under `.symphony/evidence/`, with
+  paths to traces, screenshots, videos, logs, validation summaries, or other reviewable artifacts.
+- A v1 manifest SHOULD use `schema_version: "symphony.evidence.v1"`, a non-empty `summary`, and at
+  least one `artifacts` or `commands` entry. Relative local paths SHOULD resolve from the manifest
+  directory, MUST stay inside the issue workspace, and SHOULD exist before review. URL artifacts MAY
+  be used for externally hosted proof. Artifact kinds are intentionally extensible.
+- In a blocking gate, Symphony SHOULD run a separate review agent before applying the human-review
+  tracker transition. The review agent SHOULD have full repo read access and network access for PR
+  inspection, while writes are limited to its own review artifact output. Implementations SHOULD call
+  the reviewer through the same coding-agent adapter boundary used for executor turns, even when
+  Codex is the first/default adapter.
+- A passing review allows the existing handoff transition to proceed. A failing or missing bundle
+  SHOULD be fed back into the same durable executor thread so the worker can fix code, tests, or
+  evidence and write a fresh handoff marker.
+- After `evidence.max_review_attempts`, the issue SHOULD move to an operator-input state such as
+  `needs-input`, with a comment containing the run, workspace, PR, verdict, and review summary.
+- Review attempts, bundle metadata, verdicts, and feedback SHOULD be persisted in the local run
+  ledger/API/UI. Plain plans or narration are not evidence-bundle progress.
+
+Part E: Autonomous PR review and merge gate
+
+- After a PR-ready handoff, Symphony MAY run an autonomous reviewer through the coding-agent
+  boundary. Reviewer output MUST normalize to `pass`, `request_changes`, or `needs_input` plus a
+  short summary and actionable findings.
+- The reviewer identity SHOULD be independent from the builder identity. In GitHub mode this is
+  represented by separate builder and reviewer App tokens. Symphony MUST NOT hand those private
+  credentials to executor or reviewer agents; Symphony owns GitHub writes.
+- A reviewer `pass` MAY publish the `symphony/autonomous-review` check as `success`;
+  `request_changes` publishes `failure`; `needs_input` publishes `action_required`.
+- Symphony SHOULD refuse pass-style PR approvals when the configured reviewer token is missing or
+  equals the builder token. For Symphony-authored PRs, reviewer-requested changes SHOULD route the
+  issue/PR back to executor rework rather than letting the reviewer push directly to the builder
+  branch.
+- A PR is merge-eligible only when the PR is open, CI is green, the autonomous review verdict is
+  `pass`, and that review is not stale relative to the current PR head SHA. V1 may enforce this in
+  cockpit merge actions before branch protection is configured.
 
 ### 8.6 Startup Terminal Workspace Cleanup
 
@@ -985,6 +1158,18 @@ Continuation processing:
   live thread using the targeted protocol.
 - The app-server subprocess SHOULD remain alive across those continuation turns and be stopped only
   when the worker run is ending.
+- Before a worker claims final handoff, it SHOULD write `.symphony/handoff.json` with `ready: true`
+  and a supported target state such as `human-review`, `needs-input`, `blocked`, or `done`.
+  Symphony MUST treat that file as a signal to apply and verify the tracker transition itself, not
+  as proof that the tracker already changed.
+- Local trusted durable sessions SHOULD preserve ready `.symphony/handoff.json` files across
+  restart/recovery, apply and verify them before launching another Codex turn, then clear the
+  marker only after the tracker transition is verified. Invalid or not-ready markers MAY be cleared
+  before an active work cycle. While a turn is active, local trusted sessions SHOULD watch for a
+  fresh ready marker, request Codex app-server `turn/interrupt`, wait for the interrupted
+  `turn/completed` event, then apply and verify the requested tracker transition through the normal
+  handoff path. Remote workers MAY keep the simpler post-turn handoff behavior until remote file
+  sentinels are implemented.
 
 Transport handling requirements:
 
@@ -1035,6 +1220,9 @@ Example high-trust behavior:
 - Auto-approve command execution approvals for the session.
 - Auto-approve file-change approvals for the session.
 - Treat user-input-required turns as hard failure.
+- Treat MCP/app connector elicitation requests as operator input unless the implementation has a
+  deliberately scoped auto-approval policy. GitHub issue comments, labels, branches, and PR handoff
+  can be performed non-interactively with the authenticated `gh` CLI in local trusted runs.
 
 Unsupported dynamic tool calls:
 
@@ -1100,6 +1288,7 @@ Timeouts:
 
 - `codex.read_timeout_ms`: request/response timeout during startup and sync requests
 - `codex.turn_timeout_ms`: total turn stream timeout
+- `codex.semantic_inactivity_timeout_ms`: hard stuck-run guard reset by meaningful Codex activity
 - `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
 
 Error mapping (RECOMMENDED normalized categories):
@@ -1114,9 +1303,11 @@ Error mapping (RECOMMENDED normalized categories):
 - `turn_cancelled`
 - `turn_input_required`
 
-### 10.7 Agent Runner Contract
+### 10.7 Agent Runner / Issue Session Contract
 
-The `Agent Runner` wraps workspace + prompt + app-server client.
+The `Agent Runner` wraps workspace + prompt + app-server client. Implementations MAY factor local
+trusted execution into a durable `Issue Session` owner that keeps one app-server process and one
+coding-agent thread alive for a single issue.
 
 Behavior:
 
@@ -1126,18 +1317,37 @@ Behavior:
 4. Forward app-server events to orchestrator.
 5. On any error, fail the worker attempt (the orchestrator will retry).
 
+Durable local issue-session behavior:
+
+1. `after_create` runs only when the workspace is first created.
+2. `before_run` runs at the start of each active work cycle, including rework resume.
+3. Automatic continuation turns inside one active cycle reuse the same thread and do not rerun
+   `before_run`.
+4. `after_run` runs when an active cycle parks, stops, or fails.
+5. `human-review` parks the session without stopping the app-server process.
+6. `rework` resumes the same thread with compact rework guidance and lets the agent inspect issue,
+   PR, checks, and repository state itself.
+7. Terminal/blocked/needs-input/cancelled states stop the session.
+8. If `.symphony/handoff.json` is present and ready after a turn, Symphony applies the requested
+   tracker state, refreshes the issue, and only parks/stops after the refreshed state matches the
+   requested state. A mismatch is a controller error; the worker must not be blindly continued as if
+   handoff succeeded.
+9. During local trusted turns, a ready `.symphony/handoff.json` marker interrupts the active turn
+   through Codex app-server `turn/interrupt`; session parking/stopping still happens only after the
+   app-server emits turn completion and the tracker state has been verified.
+
 Note:
 
 - Workspaces are intentionally preserved after successful runs.
 
-## 11. Issue Tracker Integration Contract (Linear-Compatible)
+## 11. Issue Tracker Integration Contract
 
 ### 11.1 REQUIRED Operations
 
 An implementation MUST support these tracker adapter operations:
 
 1. `fetch_candidate_issues()`
-   - Return issues in configured active states for a configured project.
+   - Return issues in configured active states for the configured tracker scope.
 
 2. `fetch_issues_by_states(state_names)`
    - Used for startup terminal cleanup.
@@ -1145,7 +1355,18 @@ An implementation MUST support these tracker adapter operations:
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
 
-### 11.2 Query Semantics (Linear)
+### 11.2 Query Semantics
+
+GitHub-specific requirements for `tracker.kind == "github"`:
+
+- `tracker.kind == "github"`
+- Preferred configuration is the top-level `repos` list.
+- Each repo entry MUST include `owner` and `name`; `id`, `clone_url`, `workspace_root`, and labels
+  MAY be defaulted by the config layer.
+- Candidate issue fetch SHOULD use labels as the durable state machine.
+- Claim/reconcile behavior SHOULD preserve GitHub as the source of truth for issue and PR state.
+- Pull request URL, head SHA, checks, and review status SHOULD be reconciled into the local run
+  ledger when available.
 
 Linear-specific requirements for `tracker.kind == "linear"`:
 
@@ -1394,6 +1615,7 @@ Minimum endpoints:
       "generated_at": "2026-02-24T20:15:30Z",
       "counts": {
         "running": 2,
+        "parked": 1,
         "retrying": 1
       },
       "running": [
@@ -1414,6 +1636,16 @@ Minimum endpoints:
           }
         }
       ],
+      "parked": [
+        {
+          "issue_id": "ghi789",
+          "issue_identifier": "GH-42",
+          "state": "Human Review",
+          "session_state": "parked",
+          "health": ["parked"],
+          "pr_url": "https://github.com/example/repo/pull/42"
+        }
+      ],
       "retrying": [
         {
           "issue_id": "def456",
@@ -1432,6 +1664,17 @@ Minimum endpoints:
       "rate_limits": null
     }
     ```
+
+- `GET /api/v1/repos`
+  - Returns configured repository metadata used by the cockpit.
+
+- `GET /api/v1/issues`
+  - Returns the persisted issue snapshot list, including GitHub label state and any reconciled
+    PR metadata such as PR URL, head SHA, check state, and review state.
+
+- `GET /api/v1/runs/:run_id`
+  - Returns persisted run details, including issue session identity, Codex thread/session telemetry,
+    run events, artifacts, warnings, latest error, and reconciled PR metadata when present.
 
 - `GET /api/v1/<issue_identifier>`
   - Returns issue-specific runtime/debug details for the identified issue, including any information
@@ -1504,11 +1747,24 @@ Minimum endpoints:
     }
     ```
 
+- `POST /api/v1/runs/:run_id/cancel`
+  - Requests cancellation of a running worker/session cycle.
+  - If the run is unknown, return `404`.
+
+- `POST /api/v1/issues/:repo_id/:number/rerun`
+  - Requests a new active cycle for an eligible issue.
+  - Implementations SHOULD preserve workspace, workpad, issue session, and PR context when safe.
+
+- `POST /api/v1/issues/:repo_id/:number/stop-session`
+  - Stops a running or parked durable issue session for local cleanup.
+  - If the issue session is unknown, return `404`.
+
 API design notes:
 
 - The JSON shapes above are the RECOMMENDED baseline for interoperability and debugging ergonomics.
 - Implementations MAY add fields, but SHOULD avoid breaking existing fields within a version.
-- Endpoints SHOULD be read-only except for operational triggers like `/refresh`.
+- Endpoints SHOULD be read-only except for explicit local operator controls such as `/refresh`,
+  `/cancel`, `/rerun`, and `/stop-session`.
 - Unsupported methods on defined routes SHOULD return `405 Method Not Allowed`.
 - API errors SHOULD use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.
 - If the dashboard is a client-side app, it SHOULD consume this API rather than duplicating state
@@ -1579,12 +1835,17 @@ process restart.
 
 After restart:
 
+- Persisted run-ledger rows still marked `running` SHOULD be marked interrupted/cancelled with an
+  audit event before new dispatch begins.
+- Persisted durable issue-session rows still marked `starting`, `running`, or `parked` SHOULD be
+  marked `interrupted`; app-server process/thread continuity MUST NOT be claimed after daemon
+  restart.
 - No retry timers are restored from prior process memory.
 - No running sessions are assumed recoverable.
 - Service recovers by:
   - startup terminal workspace cleanup
   - fresh polling of active issues
-  - re-dispatching eligible work
+  - re-dispatching eligible work with preserved workspace/workpad/PR context
 
 ### 14.4 Operator Intervention Points
 
@@ -1663,7 +1924,7 @@ Possible hardening measures include:
   of running with a maximally permissive configuration.
 - Adding external isolation layers such as OS/container/VM sandboxing, network restrictions, or
   separate credentials beyond the built-in Codex policy controls.
-- Filtering which Linear issues, projects, teams, labels, or other tracker sources are eligible for
+- Filtering which GitHub issues, projects, teams, labels, or other tracker sources are eligible for
   dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
 - Narrowing the `linear_graphql` tool so it can only read or mutate data inside the
   intended project scope, rather than exposing general workspace-wide tracker access.
@@ -1940,7 +2201,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Invalid YAML front matter returns typed error
 - Front matter non-map returns typed error
 - Config defaults apply when OPTIONAL values are missing
-- `tracker.kind` validation enforces currently supported kind (`linear`)
+- `tracker.kind` validation enforces currently supported kinds (`github`, `linear`, and memory test
+  fixtures)
 - `tracker.api_key` works (including `$VAR` indirection)
 - `$VAR` resolution works for tracker API key and path values
 - `~` path expansion works
@@ -1966,7 +2228,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.3 Issue Tracker Client
 
-- Candidate issue fetch uses active states and project slug
+- GitHub candidate issue fetch uses configured repos and label/state filters
 - Linear query uses the specified project filter field (`slugId`)
 - Empty `fetch_issues_by_states([])` returns empty without API call
 - Pagination preserves order across multiple pages
@@ -2084,7 +2346,8 @@ Use the same validation profiles as Section 17:
 - Reconciliation that stops runs on terminal/non-active tracker states
 - Workspace cleanup for terminal issues (startup sweep + active transition)
 - Structured logs with `issue_id`, `issue_identifier`, and `session_id`
-- Operator-visible observability (structured logs; OPTIONAL snapshot/status surface)
+- Operator-visible observability (structured logs, snapshot/status surface, and cockpit when
+  enabled)
 
 ### 18.2 RECOMMENDED Extensions (Not REQUIRED for Conformance)
 
@@ -2092,12 +2355,12 @@ Use the same validation profiles as Section 17:
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
 - `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
   app-server session using configured Symphony auth.
-- TODO: Persist retry queue and session metadata across process restarts.
-- TODO: Make observability settings configurable in workflow front matter without prescribing UI
-  implementation details.
+- TODO: Persist retry queue across process restarts. Issue-session metadata MAY already be persisted
+  for audit, but live app-server/thread continuity must still be marked interrupted on restart.
+- TODO: Make cockpit and observability settings configurable in workflow front matter.
 - TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
   of only via agent tools.
-- TODO: Add pluggable issue tracker adapters beyond Linear.
+- TODO: Continue hardening pluggable tracker adapters while keeping GitHub first-class.
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)
 
@@ -2160,7 +2423,7 @@ Extension config:
     crosses a machine boundary.
 - Startup and failover semantics:
   - Implementations SHOULD distinguish host-connectivity/startup failures from in-workspace agent
-    failures so the same ticket is not accidentally re-executed on multiple hosts.
+    failures so the same issue is not accidentally re-executed on multiple hosts.
 - Host health and saturation:
   - A dead or overloaded host SHOULD reduce available capacity, not cause duplicate execution or an
     accidental fallback to local work.

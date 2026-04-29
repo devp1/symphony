@@ -35,6 +35,10 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec fetch_artifact_marker(String.t()) ::
+          {:ok, String.t(), term()} | :missing | {:error, term()}
+  def fetch_artifact_marker(_issue_id), do: :missing
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
     send_event({:memory_tracker_comment, issue_id, body})
@@ -46,6 +50,9 @@ defmodule SymphonyElixir.Tracker.Memory do
     send_event({:memory_tracker_state_update, issue_id, state_name})
     :ok
   end
+
+  @spec preflight() :: :ok | {:error, term()}
+  def preflight, do: :ok
 
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])

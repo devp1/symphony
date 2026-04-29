@@ -46,6 +46,10 @@ defmodule SymphonyElixir.Linear.Adapter do
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids), do: client_module().fetch_issue_states_by_ids(issue_ids)
 
+  @spec fetch_artifact_marker(String.t()) ::
+          {:ok, String.t(), term()} | :missing | {:error, term()}
+  def fetch_artifact_marker(_issue_id), do: :missing
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) when is_binary(issue_id) and is_binary(body) do
     with {:ok, response} <- client_module().graphql(@create_comment_mutation, %{issueId: issue_id, body: body}),
@@ -72,6 +76,9 @@ defmodule SymphonyElixir.Linear.Adapter do
       _ -> {:error, :issue_update_failed}
     end
   end
+
+  @spec preflight() :: :ok | {:error, term()}
+  def preflight, do: :ok
 
   defp client_module do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)

@@ -20,6 +20,11 @@
 /log/
 /logs/
 
+# Local runtime state.
+/symphony.sqlite3
+/symphony.sqlite3-shm
+/symphony.sqlite3-wal
+
 # If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump
 

@@ -325,6 +325,306 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server auto-approves safe GitHub issue label bookkeeping under safer defaults" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-safe-gh-bookkeeping-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "GH-1")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-safe-gh-bookkeeping.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEX_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEX_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_TRACE:-/tmp/codex-safe-gh-bookkeeping.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}'
+            printf '%s\\n' '{"id":99,"method":"item/commandExecution/requestApproval","params":{"command":"/bin/zsh -lc '\\''gh issue edit 1 --repo devp1/Beacon --remove-label agent-ready --add-label in-progress'\\''","cwd":"/tmp","reason":"move issue state"}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "github",
+        tracker_owner: "devp1",
+        tracker_repo: "Beacon",
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "on-request"
+      )
+
+      issue = %Issue{
+        id: "1",
+        identifier: "GH-1",
+        title: "Safe GitHub bookkeeping",
+        description: "Ensure app-server can move tracker labels without pausing",
+        state: "Todo",
+        url: "https://github.com/devp1/Beacon/issues/1",
+        labels: ["symphony", "agent-ready"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Handle safe bookkeeping request", issue)
+
+      trace = File.read!(trace_file)
+      lines = String.split(trace, "\n", trim: true)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload =
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+
+                 payload["id"] == 99 and get_in(payload, ["result", "decision"]) == "acceptForSession"
+               else
+                 false
+               end
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server auto-approves safe GitHub issue comments under safer defaults" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-safe-gh-comment-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "GH-1")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-safe-gh-comment.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEX_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEX_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_TRACE:-/tmp/codex-safe-gh-comment.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-comment"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-comment"}}}'
+            printf '%s\\n' '{"id":99,"method":"item/commandExecution/requestApproval","params":{"command":"shell-escaped-command","commandActions":[{"command":"gh issue comment 1 --repo devp1/Beacon --body plan-body","type":"unknown"}],"cwd":"/tmp","reason":"comment issue plan"}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "github",
+        tracker_owner: "devp1",
+        tracker_repo: "Beacon",
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "on-request"
+      )
+
+      issue = %Issue{
+        id: "1",
+        identifier: "GH-1",
+        title: "Safe GitHub comment",
+        description: "Ensure app-server can comment on tracker issues without pausing",
+        state: "Todo",
+        url: "https://github.com/devp1/Beacon/issues/1",
+        labels: ["symphony", "agent-ready"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Handle safe comment request", issue)
+
+      trace = File.read!(trace_file)
+      lines = String.split(trace, "\n", trim: true)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload =
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+
+                 payload["id"] == 99 and get_in(payload, ["result", "decision"]) == "acceptForSession"
+               else
+                 false
+               end
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server auto-approves repo-local validation commands under safer defaults" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-safe-validation-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "GH-1")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-safe-validation.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEX_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEX_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_TRACE:-/tmp/codex-safe-validation.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-validation"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-validation"}}}'
+            printf '%s\\n' '{"id":99,"method":"item/commandExecution/requestApproval","params":{"command":"/bin/zsh -lc '\\''npm test'\\''","commandActions":[{"command":"npm test","type":"unknown"}],"cwd":"#{workspace}","reason":"Allow the full test suite to bind localhost ports?"}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "github",
+        tracker_owner: "devp1",
+        tracker_repo: "Beacon",
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "on-request"
+      )
+
+      issue = %Issue{
+        id: "1",
+        identifier: "GH-1",
+        title: "Safe validation",
+        description: "Ensure app-server can run repo-local validation without pausing",
+        state: "Todo",
+        url: "https://github.com/devp1/Beacon/issues/1",
+        labels: ["symphony", "agent-ready"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Handle safe validation request", issue)
+
+      trace = File.read!(trace_file)
+      lines = String.split(trace, "\n", trim: true)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload =
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+
+                 payload["id"] == 99 and get_in(payload, ["result", "decision"]) == "acceptForSession"
+               else
+                 false
+               end
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server auto-approves command execution approval requests when approval policy is never" do
     test_root =
       Path.join(
@@ -556,6 +856,71 @@ defmodule SymphonyElixir.AppServerTest do
                  false
                end
              end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server treats MCP elicitation requests as approval required" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-mcp-elicitation-required-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-719")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-719"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-719"}}}'
+            printf '%s\\n' '{"id":110,"method":"mcpServer/elicitation/request","params":{"serverName":"codex_apps","mode":"form","message":"Allow GitHub to add a comment?","requestedSchema":{"type":"object","properties":{}},"_meta":{"codex_approval_kind":"mcp_tool_call","tool_title":"add_comment_to_issue"}}}'
+            ;;
+          *)
+            sleep 1
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{
+        id: "issue-mcp-elicitation-required",
+        identifier: "MT-719",
+        title: "Require explicit MCP elicitation handling",
+        description: "MCP elicitation requests must not be blanket-approved",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-719",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:approval_required, payload}} =
+               AppServer.run(workspace, "Handle MCP elicitation request", issue)
+
+      assert payload["method"] == "mcpServer/elicitation/request"
+      assert get_in(payload, ["params", "_meta", "codex_approval_kind"]) == "mcp_tool_call"
     after
       File.rm_rf(test_root)
     end
@@ -1404,6 +1769,374 @@ defmodule SymphonyElixir.AppServerTest do
                end
              end)
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server resumes an existing Codex thread" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-resume-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "GH-RESUME")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-resume.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-old"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-old"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{id: "issue-resume", identifier: "GH-RESUME", title: "Resume", state: "In Progress"}
+
+      assert {:ok, session} = AppServer.start_session(workspace, resume_thread_id: "thread-old")
+      assert session.thread_id == "thread-old"
+      assert session.metadata.resume_attempted == true
+      assert session.metadata.resume_succeeded == true
+
+      assert {:ok, _turn} = AppServer.run_turn(session, "continue", issue)
+
+      lines =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      assert Enum.any?(lines, &(&1["method"] == "thread/resume"))
+      refute Enum.any?(lines, &(&1["method"] == "thread/start"))
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server falls back to a new persisted thread when resume fails" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-resume-fallback-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "GH-FALLBACK")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-resume-fallback.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"error":{"message":"missing thread"}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-new"}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-new"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{id: "issue-fallback", identifier: "GH-FALLBACK", title: "Fallback", state: "In Progress"}
+
+      assert {:ok, session} = AppServer.start_session(workspace, resume_thread_id: "thread-missing")
+      assert session.thread_id == "thread-new"
+      assert session.metadata.resume_attempted == true
+      assert session.metadata.resume_succeeded == false
+      assert is_binary(session.metadata.resume_failure_reason)
+
+      assert {:ok, _turn} = AppServer.run_turn(session, "continue", issue)
+
+      lines =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      assert Enum.any?(lines, &(&1["method"] == "thread/resume"))
+
+      assert Enum.any?(lines, fn payload ->
+               payload["method"] == "thread/start" &&
+                 get_in(payload, ["params", "persistExtendedHistory"]) == true
+             end)
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server ignores terminal events from other Codex threads" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-thread-filter-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "GH-THREAD-FILTER")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-active"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-active"}}}'
+            printf '%s\\n' '{"method":"turn/failed","params":{"threadId":"thread-other","error":{"message":"wrong thread"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-active"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{id: "issue-thread-filter", identifier: "GH-THREAD-FILTER", title: "Filter", state: "In Progress"}
+
+      assert {:ok, _turn} = AppServer.run(workspace, "continue", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server reports semantic inactivity when Codex goes quiet after turn start" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-semantic-timeout-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "GH-QUIET")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-quiet"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-quiet"}}}'
+            sleep 1
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_semantic_inactivity_timeout_ms: 50
+      )
+
+      issue = %Issue{id: "issue-quiet", identifier: "GH-QUIET", title: "Quiet", state: "In Progress"}
+
+      assert {:error, {:semantic_inactivity_timeout, %{timeout_ms: 50, last_activity_reason: "turn/start"}}} =
+               AppServer.run(workspace, "continue", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server interrupts an active turn when a sentinel fires" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-turn-sentinel-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "GH-HANDOFF")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+      marker_path = Path.join(workspace, ".symphony/handoff.json")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-turn-sentinel.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-handoff"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-handoff"}}}'
+            mkdir -p .symphony
+            printf '%s\\n' '{"ready":true,"state":"human-review","reason":"pr-ready"}' > .symphony/handoff.json
+            ;;
+          5)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-handoff","turn":{"id":"turn-handoff","status":"interrupted"}}}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{id: "issue-handoff", identifier: "GH-HANDOFF", title: "Handoff", state: "In Progress"}
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      sentinel = fn ->
+        if File.regular?(marker_path) do
+          {:interrupt, :handoff_ready, %{marker_path: marker_path}}
+        else
+          :continue
+        end
+      end
+
+      assert {:ok, turn} =
+               AppServer.run(workspace, "finish handoff", issue,
+                 on_message: on_message,
+                 turn_interrupt_sentinel: sentinel,
+                 turn_interrupt_poll_ms: 10
+               )
+
+      assert {:turn_interrupted, %{reason: :handoff_ready, turn_id: "turn-handoff"}} = turn.result
+      assert_received {:app_server_message, %{event: :turn_interrupt_requested, reason: :handoff_ready}}
+
+      lines =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      assert Enum.any?(lines, fn payload ->
+               payload["method"] == "turn/interrupt" &&
+                 get_in(payload, ["params", "threadId"]) == "thread-handoff" &&
+                 get_in(payload, ["params", "turnId"]) == "turn-handoff"
+             end)
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
     end
   end

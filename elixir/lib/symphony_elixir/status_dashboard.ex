@@ -333,6 +333,8 @@ defmodule SymphonyElixir.StatusDashboard do
   defp format_snapshot_content(snapshot_data, tps, terminal_columns_override \\ nil) do
     case snapshot_data do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
+        active_running = Enum.reject(running, &parked_entry?/1)
+        parked_count = length(running) - length(active_running)
         rate_limits = Map.get(snapshot, :rate_limits)
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
@@ -340,11 +342,11 @@ defmodule SymphonyElixir.StatusDashboard do
         codex_output_tokens = Map.get(codex_totals, :output_tokens, 0)
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
         codex_seconds_running = Map.get(codex_totals, :seconds_running, 0)
-        agent_count = length(running)
+        agent_count = length(active_running)
         max_agents = Config.settings!().agent.max_concurrent_agents
         running_event_width = running_event_width(terminal_columns_override)
-        running_rows = format_running_rows(running, running_event_width)
-        running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
+        running_rows = format_running_rows(active_running, running_event_width)
+        running_to_backoff_spacer = if(active_running == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
 
         ([
@@ -352,7 +354,8 @@ defmodule SymphonyElixir.StatusDashboard do
            colorize("│ Agents: ", @ansi_bold) <>
              colorize("#{agent_count}", @ansi_green) <>
              colorize("/", @ansi_gray) <>
-             colorize("#{max_agents}", @ansi_gray),
+             colorize("#{max_agents}", @ansi_gray) <>
+             parked_suffix(parked_count),
            colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
            colorize("│ Runtime: ", @ansi_bold) <>
              colorize(format_runtime_seconds(codex_seconds_running), @ansi_magenta),
@@ -428,6 +431,11 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
+
+  defp parked_entry?(entry), do: Map.get(entry, :session_state) in [:parked, "parked"]
+
+  defp parked_suffix(0), do: ""
+  defp parked_suffix(count), do: colorize(" (+#{count} parked)", @ansi_gray)
 
   defp dashboard_url do
     dashboard_url(Config.settings!().server.host, Config.server_port(), HttpServer.bound_port())
@@ -589,7 +597,7 @@ defmodule SymphonyElixir.StatusDashboard do
   # credo:disable-for-next-line
   defp format_running_summary(running_entry, running_event_width) do
     issue = format_cell(running_entry.identifier || "unknown", @running_id_width)
-    state = running_entry.state || "unknown"
+    state = Map.get(running_entry, :session_state) || running_entry.state || "unknown"
     state_display = format_cell(to_string(state), @running_stage_width)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
     pid = format_cell(running_entry.codex_app_server_pid || "n/a", @running_pid_width)
@@ -1363,6 +1371,18 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp humanize_codex_method("tool/requestUserInput", payload),
     do: humanize_codex_method("item/tool/requestUserInput", payload)
+
+  defp humanize_codex_method("mcpServer/elicitation/request", payload) do
+    tool_title =
+      map_path(payload, ["params", "_meta", "tool_title"]) ||
+        map_path(payload, [:params, :_meta, :tool_title])
+
+    if is_binary(tool_title) and String.trim(tool_title) != "" do
+      "MCP elicitation requested (#{inline_text(tool_title)})"
+    else
+      "MCP elicitation requested"
+    end
+  end
 
   defp humanize_codex_method("account/updated", payload) do
     auth_mode =

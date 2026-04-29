@@ -153,15 +153,19 @@ defmodule SymphonyElixir.AutonomousReview do
     verdict = normalize_verdict(Map.get(attrs, :verdict) || Map.get(attrs, "verdict"))
     attrs = Map.put(attrs, :verdict, verdict)
 
-    with {:ok, _review_id} <- record(issue, attrs),
+    with :ok <- ensure_publishable_reviewer_identity(verdict),
+         :ok <- GitHub.Client.submit_autonomous_pr_review(issue, attrs),
+         {:ok, _review_id} <- record(issue, attrs),
          :ok <- GitHub.Client.upsert_autonomous_review_check(issue, attrs) do
-      case GitHub.Client.submit_autonomous_pr_review(issue, attrs) do
-        :ok -> :ok
-        {:error, :reviewer_identity_not_independent} when verdict == "pass" -> :ok
-        {:error, reason} -> {:error, reason}
-      end
+      :ok
     end
   end
+
+  defp ensure_publishable_reviewer_identity("pass") do
+    if Config.independent_github_reviewer?(), do: :ok, else: {:error, :reviewer_identity_not_independent}
+  end
+
+  defp ensure_publishable_reviewer_identity(_verdict), do: :ok
 
   @spec merge_gate(Issue.t(), map() | nil) :: gate()
   def merge_gate(%Issue{} = issue, latest_review \\ nil) do

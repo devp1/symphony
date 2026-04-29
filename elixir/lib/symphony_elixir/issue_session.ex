@@ -619,22 +619,12 @@ defmodule SymphonyElixir.IssueSession do
         {:ok, state}
 
       not reviewable_pr?(issue) ->
-        _ =
-          Storage.append_event(state.run_id, "info", "autonomous review skipped", %{
-            issue_session_id: state.issue_session_id,
-            reason: "missing-pr",
-            handoff: payload
-          })
+        _ = record_autonomous_review_skip(state, issue, "missing-pr", payload)
 
         {:ok, state}
 
       not Config.independent_github_reviewer?() ->
-        _ =
-          Storage.append_event(state.run_id, "info", "autonomous review skipped", %{
-            issue_session_id: state.issue_session_id,
-            reason: "missing-independent-reviewer-token",
-            handoff: payload
-          })
+        _ = record_autonomous_review_skip(state, issue, "missing-independent-reviewer-token", payload)
 
         {:ok, %{state | issue: issue}}
 
@@ -644,6 +634,42 @@ defmodule SymphonyElixir.IssueSession do
   end
 
   defp maybe_run_autonomous_pr_review_handoff(state, _handoff, _target_state, _payload), do: {:ok, state}
+
+  defp record_autonomous_review_skip(state, issue, reason, payload) do
+    summary = autonomous_review_skip_summary(reason)
+
+    _ =
+      AutonomousReview.record(issue, %{
+        run_id: state.run_id,
+        issue_session_id: state.issue_session_id,
+        verdict: "needs_input",
+        summary: summary,
+        findings: [%{reason: reason, body: autonomous_review_skip_detail(reason)}]
+      })
+
+    Storage.append_event(state.run_id, "warning", "autonomous review skipped", %{
+      issue_session_id: state.issue_session_id,
+      reason: reason,
+      summary: summary,
+      handoff: payload
+    })
+  end
+
+  defp autonomous_review_skip_summary("missing-pr"),
+    do: "Autonomous PR review skipped: no pull request was available in the review-ready handoff."
+
+  defp autonomous_review_skip_summary("missing-independent-reviewer-token"),
+    do: "Autonomous PR review skipped: configure a distinct GitHub reviewer identity."
+
+  defp autonomous_review_skip_summary(reason), do: "Autonomous PR review skipped: #{reason}."
+
+  defp autonomous_review_skip_detail("missing-pr"),
+    do: "The worker asked to park at human-review, but the handoff did not include a reviewable PR URL or PR number."
+
+  defp autonomous_review_skip_detail("missing-independent-reviewer-token"),
+    do: "Symphony needs a reviewer token or GitHub App identity that is present and distinct from the builder identity before it can publish an independent review verdict."
+
+  defp autonomous_review_skip_detail(reason), do: "Review skipped because #{reason}."
 
   defp run_autonomous_pr_review(state, handoff) do
     review_runner =

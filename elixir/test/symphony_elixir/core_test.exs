@@ -335,6 +335,44 @@ defmodule SymphonyElixir.CoreTest do
              SymphonyElixir.Storage.list_autonomous_reviews()
   end
 
+  test "autonomous review pass publish requires independent reviewer identity" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_builder_token: "same-token",
+      github_reviewer_token: "same-token"
+    )
+
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :github_command_fun, fn args, env ->
+      send(parent, {:unexpected_gh_args, args, env})
+      {"{}", 0}
+    end)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
+
+    issue = %Issue{
+      id: "beacon#25",
+      identifier: "GH-25",
+      title: "PR-ready handoff",
+      repo_id: "beacon",
+      repo_owner: "devp1",
+      repo_name: "Beacon",
+      number: 25,
+      pr_url: "https://github.com/devp1/Beacon/pull/25",
+      pr_number: 25,
+      head_sha: "abc123"
+    }
+
+    assert {:error, :reviewer_identity_not_independent} =
+             SymphonyElixir.AutonomousReview.publish(issue, %{verdict: "pass", summary: "clean"})
+
+    refute_received {:unexpected_gh_args, _args, _env}
+    assert [] = SymphonyElixir.Storage.list_autonomous_reviews()
+  end
+
   test "autonomous review runs a reviewer agent and publishes the check/review" do
     workspace =
       Path.join(
@@ -396,13 +434,13 @@ defmodule SymphonyElixir.CoreTest do
       assert prompt =~ "Autonomous PR review contract"
       assert prompt =~ "https://github.com/devp1/Beacon/pull/25"
 
-      assert_received {:gh_args, check_args, [{"GH_TOKEN", "reviewer-token"}, {"GITHUB_TOKEN", "reviewer-token"}]}
-      assert ["api", "repos/devp1/Beacon/check-runs" | _] = check_args
-      assert "conclusion=failure" in check_args
-
       assert_received {:gh_args, review_args, [{"GH_TOKEN", "reviewer-token"}, {"GITHUB_TOKEN", "reviewer-token"}]}
       assert ["api", "repos/devp1/Beacon/pulls/25/reviews" | _] = review_args
       assert "event=REQUEST_CHANGES" in review_args
+
+      assert_received {:gh_args, check_args, [{"GH_TOKEN", "reviewer-token"}, {"GITHUB_TOKEN", "reviewer-token"}]}
+      assert ["api", "repos/devp1/Beacon/check-runs" | _] = check_args
+      assert "conclusion=failure" in check_args
 
       assert [
                %{

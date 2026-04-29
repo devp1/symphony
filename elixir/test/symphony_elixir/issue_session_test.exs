@@ -343,6 +343,135 @@ defmodule SymphonyElixir.IssueSessionTest do
     end
   end
 
+  test "durable issue session records needs-input review when reviewer identity is missing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-issue-session-missing-reviewer-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(test_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-missing-reviewer"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-missing-reviewer"}}}'
+            mkdir -p .symphony
+            printf '%s\\n' '{"ready":true,"state":"human-review","reason":"pr-ready","pr_url":"https://github.com/devp1/Beacon/pull/25"}' > .symphony/handoff.json
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "github",
+        tracker_owner: "devp1",
+        tracker_repo: "Beacon",
+        github_builder_token: "builder-token",
+        github_reviewer_token: nil,
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      parent = self()
+
+      Application.put_env(:symphony_elixir, :github_command_fun, fn args, env ->
+        send(parent, {:gh_args, args, env})
+        {"{}", 0}
+      end)
+
+      issue = %Issue{
+        id: "25",
+        identifier: "GH-25",
+        title: "Missing reviewer handoff",
+        description: "The worker opened a review-ready PR.",
+        state: "In Progress",
+        url: "https://github.com/devp1/Beacon/issues/25",
+        repo_id: "github",
+        repo_owner: "devp1",
+        repo_name: "Beacon",
+        number: 25,
+        head_sha: "abc123",
+        labels: []
+      }
+
+      issue_state_fetcher = fn [_issue_id] ->
+        {:ok, [%{issue | state: "Human Review", pr_url: "https://github.com/devp1/Beacon/pull/25"}]}
+      end
+
+      assert {:ok, "issue-session-missing-reviewer"} =
+               SymphonyElixir.Storage.start_issue_session(%{
+                 id: "issue-session-missing-reviewer",
+                 issue_identifier: issue.identifier,
+                 state: "running",
+                 current_run_id: "run-missing-reviewer"
+               })
+
+      assert {:ok, "run-missing-reviewer"} =
+               SymphonyElixir.Storage.start_run(%{
+                 id: "run-missing-reviewer",
+                 issue_identifier: issue.identifier,
+                 issue_session_id: "issue-session-missing-reviewer",
+                 state: "running",
+                 session_state: "running"
+               })
+
+      assert {:ok, _pid} =
+               IssueSession.start_link(
+                 issue: issue,
+                 recipient: self(),
+                 issue_session_id: "issue-session-missing-reviewer",
+                 run_id: "run-missing-reviewer",
+                 issue_state_fetcher: issue_state_fetcher
+               )
+
+      assert_receive {:issue_session_state, "25", %{session_state: :parked, health: ["parked"], stop_reason: "human_review"}}, 5_000
+
+      assert_received {:gh_args, ["api", "repos/devp1/Beacon/issues/25" | _], [{"GH_TOKEN", "builder-token"}, {"GITHUB_TOKEN", "builder-token"}]}
+
+      stored_run = SymphonyElixir.Storage.get_run("run-missing-reviewer")
+      assert stored_run["state"] == "parked"
+      assert Enum.any?(stored_run["events"], &(&1["message"] == "autonomous review skipped"))
+      assert Enum.any?(stored_run["events"], &(&1["message"] == "worker handoff state verified"))
+
+      assert [
+               %{
+                 "verdict" => "needs_input",
+                 "summary" => summary,
+                 "check_conclusion" => "action_required",
+                 "head_sha" => "abc123"
+               }
+             ] = stored_run["autonomous_reviews"]
+
+      assert summary =~ "distinct GitHub reviewer identity"
+    after
+      Application.delete_env(:symphony_elixir, :github_command_fun)
+      File.rm_rf(test_root)
+    end
+  end
+
   test "durable issue session routes autonomous review changes back to same executor thread" do
     test_root =
       Path.join(

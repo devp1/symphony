@@ -496,7 +496,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+        continue_receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -513,13 +513,13 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+        continue_receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
     end
   end
 
   defp handle_turn_completed(port, on_message, payload, payload_string, tool_executor, auto_approve_requests, activity) do
     if foreign_thread_notification?(payload, activity.thread_id) do
-      receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+      continue_receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
     else
       emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
       {:ok, turn_completion_result(activity)}
@@ -528,7 +528,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp handle_turn_failed(port, on_message, payload, payload_string, tool_executor, auto_approve_requests, activity) do
     if foreign_thread_notification?(payload, activity.thread_id) do
-      receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+      continue_receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
     else
       emit_turn_event(
         on_message,
@@ -545,7 +545,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp handle_turn_cancelled(port, on_message, payload, payload_string, tool_executor, auto_approve_requests, activity) do
     if foreign_thread_notification?(payload, activity.thread_id) do
-      receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+      continue_receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
     else
       emit_turn_event(
         on_message,
@@ -631,6 +631,16 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_interrupt_for_sentinel(_port, _on_message, activity), do: {:ok, activity}
+
+  defp continue_receive_loop(port, on_message, pending_line, tool_executor, auto_approve_requests, activity) do
+    case maybe_interrupt_for_sentinel(port, on_message, activity) do
+      {:ok, activity} ->
+        receive_loop(port, on_message, pending_line, tool_executor, auto_approve_requests, activity)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   defp request_turn_interrupt(port, on_message, activity, reason, details) do
     payload = %{
@@ -791,7 +801,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          activity
        ) do
     if foreign_thread_notification?(payload, activity.thread_id) do
-      receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+      continue_receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
     else
       handle_current_thread_method(
         port,
@@ -856,7 +866,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp handle_turn_decision(:approved, context) do
-    receive_loop(
+    continue_receive_loop(
       context.port,
       context.on_message,
       "",
@@ -892,7 +902,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       Logger.debug("Codex notification: #{inspect(method)}")
 
-      receive_loop(
+      continue_receive_loop(
         context.port,
         context.on_message,
         "",

@@ -2140,4 +2140,115 @@ defmodule SymphonyElixir.AppServerTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "app server interrupts a streaming active turn when a sentinel fires" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-streaming-turn-sentinel-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "GH-STREAM-HANDOFF")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+      marker_path = Path.join(workspace, ".symphony/handoff.json")
+      stream_stop_file = Path.join(test_root, "stop-stream")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-streaming-turn-sentinel.trace}"
+      stop_file="${SYMP_TEST_STREAM_STOP:-/tmp/codex-streaming-turn-sentinel.stop}"
+      count=0
+      stream_pid=""
+
+      cleanup() {
+        if [ -n "$stream_pid" ]; then
+          kill "$stream_pid" 2>/dev/null || true
+          wait "$stream_pid" 2>/dev/null || true
+        fi
+      }
+
+      trap cleanup EXIT
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-stream-handoff"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-stream-handoff"}}}'
+            mkdir -p .symphony
+            printf '%s\\n' '{"ready":true,"state":"human-review","reason":"pr-ready"}' > .symphony/handoff.json
+            (
+              while [ ! -f "$stop_file" ]; do
+                printf '%s\\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-stream-handoff","delta":"still streaming after handoff"}}'
+                sleep 0.05
+              done
+            ) &
+            stream_pid=$!
+            ;;
+          5)
+            touch "$stop_file"
+            cleanup
+            printf '%s\\n' '{"id":4,"result":{}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-stream-handoff","turn":{"id":"turn-stream-handoff","status":"interrupted"}}}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      System.put_env("SYMP_TEST_STREAM_STOP", stream_stop_file)
+
+      on_exit(fn ->
+        System.delete_env("SYMP_TEST_CODEx_TRACE")
+        System.delete_env("SYMP_TEST_STREAM_STOP")
+      end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{id: "issue-stream-handoff", identifier: "GH-STREAM-HANDOFF", title: "Streaming handoff", state: "In Progress"}
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      sentinel = fn ->
+        if File.regular?(marker_path) do
+          {:interrupt, :handoff_ready, %{marker_path: marker_path}}
+        else
+          :continue
+        end
+      end
+
+      assert {:ok, turn} =
+               AppServer.run(workspace, "finish handoff", issue,
+                 on_message: on_message,
+                 turn_interrupt_sentinel: sentinel,
+                 turn_interrupt_poll_ms: 10
+               )
+
+      assert {:turn_interrupted, %{reason: :handoff_ready, turn_id: "turn-stream-handoff"}} = turn.result
+      assert_received {:app_server_message, %{event: :turn_interrupt_requested, reason: :handoff_ready}}
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      System.delete_env("SYMP_TEST_STREAM_STOP")
+      File.rm_rf(test_root)
+    end
+  end
 end

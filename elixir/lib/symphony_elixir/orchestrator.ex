@@ -624,6 +624,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp park_durable_issue_session(%State{} = state, %Issue{} = issue) do
     case Map.get(state.running, issue.id) do
+      %{session_kind: :durable, session_state: :parked} = running_entry ->
+        updated_entry = Map.put(running_entry, :issue, issue)
+        %{state | running: Map.put(state.running, issue.id, updated_entry)}
+
       %{session_kind: :durable} = running_entry ->
         parked_at = DateTime.utc_now()
 

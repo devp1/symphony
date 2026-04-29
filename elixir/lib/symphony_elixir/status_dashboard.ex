@@ -597,7 +597,7 @@ defmodule SymphonyElixir.StatusDashboard do
   # credo:disable-for-next-line
   defp format_running_summary(running_entry, running_event_width) do
     issue = format_cell(running_entry.identifier || "unknown", @running_id_width)
-    state = Map.get(running_entry, :session_state) || running_entry.state || "unknown"
+    state = running_stage(running_entry)
     state_display = format_cell(to_string(state), @running_stage_width)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
     pid = format_cell(running_entry.codex_app_server_pid || "n/a", @running_pid_width)
@@ -606,7 +606,7 @@ defmodule SymphonyElixir.StatusDashboard do
     turn_count = Map.get(running_entry, :turn_count, 0)
     age = format_cell(format_runtime_and_turns(runtime_seconds, turn_count), @running_age_width)
     event = running_entry.last_codex_event || "none"
-    event_label = format_cell(summarize_message(running_entry.last_codex_message), running_event_width)
+    event_label = format_cell(summarize_running_message(running_entry), running_event_width)
 
     tokens = format_count(total_tokens) |> format_cell(@running_tokens_width, :right)
 
@@ -644,6 +644,33 @@ defmodule SymphonyElixir.StatusDashboard do
   @spec format_running_summary_for_test(map(), integer() | nil) :: String.t()
   def format_running_summary_for_test(running_entry, terminal_columns \\ nil),
     do: format_running_summary(running_entry, running_event_width(terminal_columns))
+
+  defp running_stage(running_entry) do
+    health = Map.get(running_entry, :health, [])
+
+    cond do
+      "reviewing-evidence" in health -> "reviewing-evidence"
+      "reviewing-pr" in health -> "reviewing-pr"
+      true -> Map.get(running_entry, :session_state) || running_entry.state || "unknown"
+    end
+  end
+
+  defp summarize_running_message(running_entry) do
+    case Map.get(running_entry, :last_codex_message) do
+      nil -> summarize_session_health(Map.get(running_entry, :health, []))
+      message -> summarize_message(message)
+    end
+  end
+
+  defp summarize_session_health(health) when is_list(health) do
+    cond do
+      "reviewing-evidence" in health -> "evidence review in progress"
+      "reviewing-pr" in health -> "autonomous PR review in progress"
+      true -> summarize_message(nil)
+    end
+  end
+
+  defp summarize_session_health(_health), do: summarize_message(nil)
 
   @doc false
   @spec format_tps_for_test(number()) :: String.t()

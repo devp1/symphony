@@ -14,6 +14,8 @@ defmodule SymphonyElixir.IssueSession do
   alias SymphonyElixir.{AutonomousReview, CodingAgent, Config, Evidence, Handoff, Linear.Issue, PromptBuilder}
   alias SymphonyElixir.{Storage, Tracker, Workpad, Workspace}
 
+  @handoff_review_heartbeat_ms if Mix.env() == :test, do: 50, else: 30_000
+
   @type worker_host :: String.t() | nil
   @type session_state :: :starting | :running | :parked | :stopped | :failed
 
@@ -680,7 +682,17 @@ defmodule SymphonyElixir.IssueSession do
         )
       end)
 
-    case review_runner.(state.workspace, state.issue) do
+    review_result =
+      run_handoff_stage(
+        state,
+        "reviewing-pr",
+        "autonomous PR review in progress",
+        "autonomous review started",
+        %{issue_session_id: state.issue_session_id, pr_url: handoff_pr_url(handoff)},
+        fn -> review_runner.(state.workspace, state.issue) end
+      )
+
+    case review_result do
       {:ok, review} ->
         handle_autonomous_review_result(state, handoff, review)
 
@@ -828,6 +840,9 @@ defmodule SymphonyElixir.IssueSession do
     %{issue | pr_url: pr_url, pr_number: issue.pr_number || pr_number_from_url(pr_url)}
   end
 
+  defp handoff_pr_url(handoff) when is_map(handoff), do: Map.get(handoff, :pr_url)
+  defp handoff_pr_url(_handoff), do: nil
+
   defp reviewable_pr?(%Issue{pr_url: pr_url, pr_number: pr_number}) do
     (is_binary(pr_url) and String.trim(pr_url) != "") or not is_nil(pr_number)
   end
@@ -869,7 +884,22 @@ defmodule SymphonyElixir.IssueSession do
             Evidence.review_bundle(workspace, issue, handoff, bundle)
           end)
 
-        case review_runner.(state.workspace, state.issue, handoff, bundle) do
+        review_result =
+          run_handoff_stage(
+            state,
+            "reviewing-evidence",
+            "evidence review in progress",
+            "evidence review started",
+            %{
+              issue_session_id: state.issue_session_id,
+              bundle_id: bundle_id,
+              attempt: attempt,
+              manifest_path: bundle.manifest_path
+            },
+            fn -> review_runner.(state.workspace, state.issue, handoff, bundle) end
+          )
+
+        case review_result do
           {:ok, %{verdict: "pass"} = review} ->
             record_evidence_review(state, bundle_id, attempt, review)
             record_evidence_bundle_status(state, bundle_id, bundle, "review_passed", "pass", Map.get(review, :summary))
@@ -955,6 +985,55 @@ defmodule SymphonyElixir.IssueSession do
       feedback: Map.get(review, :feedback, %{}),
       output_path: Map.get(review, :output_path)
     })
+  end
+
+  defp run_handoff_stage(%__MODULE__{} = state, health_flag, status_message, event_message, metadata, fun)
+       when is_binary(health_flag) and is_binary(status_message) and is_binary(event_message) and is_function(fun, 0) do
+    metadata = metadata || %{}
+    payload = Map.merge(%{issue_session_id: state.issue_session_id, health: [health_flag]}, metadata)
+
+    _ = Storage.append_event(state.run_id, "info", event_message, payload)
+    publish_session_state(state, :running, %{health: [health_flag], stop_reason: nil})
+
+    task =
+      Task.async(fn ->
+        try do
+          {:ok, fun.()}
+        rescue
+          error ->
+            {:error, {error.__struct__, Exception.message(error)}}
+        catch
+          kind, reason ->
+            {:error, {kind, reason}}
+        end
+      end)
+
+    await_handoff_stage(task, state, health_flag, status_message, event_message, metadata)
+  end
+
+  defp await_handoff_stage(task, state, health_flag, status_message, event_message, metadata) do
+    case Task.yield(task, @handoff_review_heartbeat_ms) do
+      {:ok, {:ok, result}} ->
+        result
+
+      {:ok, {:error, reason}} ->
+        {:error, reason}
+
+      {:exit, reason} ->
+        {:error, reason}
+
+      nil ->
+        _ =
+          Storage.append_event(
+            state.run_id,
+            "info",
+            "#{event_message} heartbeat",
+            Map.merge(%{issue_session_id: state.issue_session_id, status: status_message, health: [health_flag]}, metadata)
+          )
+
+        publish_session_state(state, :running, %{health: [health_flag], stop_reason: nil})
+        await_handoff_stage(task, state, health_flag, status_message, event_message, metadata)
+    end
   end
 
   defp handle_evidence_gate_failure(state, handoff, bundle_id, attempt, review, reason) do

@@ -1329,6 +1329,28 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute plain =~ " notification "
   end
 
+  test "status dashboard renders handoff review stages without codex messages" do
+    row =
+      StatusDashboard.format_running_summary_for_test(%{
+        identifier: "GH-24",
+        state: "running",
+        session_state: :running,
+        health: ["reviewing-pr"],
+        session_id: nil,
+        codex_app_server_pid: nil,
+        codex_total_tokens: 0,
+        runtime_seconds: 42,
+        last_codex_event: nil,
+        last_codex_message: nil
+      })
+
+    plain = Regex.replace(~r/\e\[[\d;]*m/, row, "")
+
+    assert plain =~ "reviewing-pr"
+    assert plain =~ "autonomous PR review in progress"
+    refute plain =~ "no codex message yet"
+  end
+
   test "status dashboard strips ANSI and control bytes from last codex message" do
     payload =
       "cmd: " <>

@@ -316,6 +316,7 @@ defmodule SymphonyElixir.IssueSessionTest do
                  issue_state_fetcher: issue_state_fetcher,
                  autonomous_review_runner: fn _workspace, review_issue ->
                    send(parent, {:autonomous_review_runner, review_issue.pr_url, review_issue.pr_number})
+                   Process.sleep(120)
 
                    {:ok,
                     %{
@@ -327,6 +328,7 @@ defmodule SymphonyElixir.IssueSessionTest do
                  end
                )
 
+      assert_receive {:issue_session_state, "25", %{session_state: :running, health: ["reviewing-pr"]}}, 5_000
       assert_receive {:autonomous_review_runner, "https://github.com/devp1/Beacon/pull/25", 25}, 5_000
 
       assert_receive {:issue_session_state, "25", %{session_state: :parked, health: ["parked"], stop_reason: "human_review"}}, 5_000
@@ -335,6 +337,8 @@ defmodule SymphonyElixir.IssueSessionTest do
 
       stored_run = SymphonyElixir.Storage.get_run("run-autonomous-review")
       assert stored_run["state"] == "parked"
+      assert Enum.any?(stored_run["events"], &(&1["message"] == "autonomous review started"))
+      assert Enum.any?(stored_run["events"], &(&1["message"] == "autonomous review started heartbeat"))
       assert Enum.any?(stored_run["events"], &(&1["message"] == "autonomous review passed"))
       assert Enum.any?(stored_run["events"], &(&1["message"] == "worker handoff state verified"))
     after
@@ -842,6 +846,8 @@ defmodule SymphonyElixir.IssueSessionTest do
                  workspace_path: workspace,
                  issue_state_fetcher: issue_state_fetcher,
                  evidence_review_runner: fn _workspace, _issue, _handoff, _bundle ->
+                   Process.sleep(120)
+
                    {:ok,
                     %{
                       verdict: "pass",
@@ -852,6 +858,9 @@ defmodule SymphonyElixir.IssueSessionTest do
                     }}
                  end
                )
+
+      assert_receive {:issue_session_state, "issue-startup-evidence", %{session_state: :running, health: ["reviewing-evidence"]}},
+                     5_000
 
       assert_receive {:memory_tracker_state_update, "issue-startup-evidence", "Human Review"}, 5_000
 
@@ -864,6 +873,8 @@ defmodule SymphonyElixir.IssueSessionTest do
       stored_run = SymphonyElixir.Storage.get_run("run-startup-evidence")
       assert stored_run["state"] == "parked"
       assert stored_run["session_state"] == "parked"
+      assert Enum.any?(stored_run["events"], &(&1["message"] == "evidence review started"))
+      assert Enum.any?(stored_run["events"], &(&1["message"] == "evidence review started heartbeat"))
       assert Enum.any?(stored_run["events"], &(&1["message"] == "evidence review passed"))
       assert Enum.any?(stored_run["events"], &(&1["message"] == "worker handoff state verified"))
       refute Enum.any?(stored_run["events"], &(&1["message"] == "cleared stale worker handoff file"))

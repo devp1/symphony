@@ -1907,6 +1907,22 @@ defmodule SymphonyElixir.CoreTest do
     assert stored_run["health"] == ["parked"]
     assert is_nil(stored_run["error"])
     assert Enum.any?(stored_run["events"], &(&1["message"] == "durable issue session parked"))
+
+    next_state_after_second_reconcile =
+      Orchestrator.reconcile_issue_states_for_test(
+        [%{issue | state: "human-review"}],
+        next_state
+      )
+
+    assert %{session_state: :parked, health: ["parked"], stop_reason: "human_review"} =
+             next_state_after_second_reconcile.running[issue.id]
+
+    stored_run_after_second_reconcile = SymphonyElixir.Storage.get_run("run-park")
+
+    assert Enum.count(
+             stored_run_after_second_reconcile["events"],
+             &(&1["message"] == "durable issue session parked")
+           ) == 1
   end
 
   test "late codex updates do not reopen parked durable run rows" do

@@ -65,6 +65,10 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+After changing Elixir source, run `mise exec -- mix build` again before dogfooding
+`./bin/symphony`. The checked-in escript is static; running a stale binary can make
+the cockpit look like it ignored source fixes.
+
 ## Configuration
 
 Pass a custom workflow file path to `./bin/symphony` when starting the service:

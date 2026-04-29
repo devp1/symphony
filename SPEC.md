@@ -111,6 +111,8 @@ Important boundary:
 7. `Status Surface` (OPTIONAL)
    - Presents human-readable runtime status (for example terminal output, dashboard, or other
      operator-facing view).
+   - SHOULD expose enough runtime identity to distinguish the running binary from the checkout,
+     such as implementation version, build/source SHA when available, workflow path, and config path.
 
 8. `Logging`
    - Emits structured runtime logs to one or more configured sinks.

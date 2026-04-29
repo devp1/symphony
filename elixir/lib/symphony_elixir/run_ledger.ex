@@ -64,17 +64,19 @@ defmodule SymphonyElixir.RunLedger do
   def persist_codex_update(%{run_id: run_id} = running_entry, update) when is_binary(run_id) do
     event = update[:event] || Map.get(update, :event)
     message = StatusDashboard.humanize_codex_message(Map.get(running_entry, :last_codex_message))
+    session_state = Map.get(running_entry, :session_state)
 
     Storage.update_run(
       run_id,
       %{
-        state: "running",
+        state: run_state_for_session_state(session_state),
+        error: run_error_for_session_state(session_state, Map.get(running_entry, :stop_reason)),
         workspace_path: Map.get(running_entry, :workspace_path),
         session_id: Map.get(running_entry, :session_id),
         issue_session_id: Map.get(running_entry, :issue_session_id),
         thread_id: Map.get(running_entry, :thread_id),
         turn_count: Map.get(running_entry, :turn_count),
-        session_state: Map.get(running_entry, :session_state),
+        session_state: session_state,
         health: Map.get(running_entry, :health, ["healthy"])
       }
       |> Map.merge(run_pr_metadata_attrs(Map.get(running_entry, :issue)))
@@ -173,6 +175,18 @@ defmodule SymphonyElixir.RunLedger do
   end
 
   defp run_pr_metadata_attrs(_issue), do: %{}
+
+  defp run_state_for_session_state(:parked), do: "parked"
+  defp run_state_for_session_state("parked"), do: "parked"
+  defp run_state_for_session_state(:stopped), do: "completed"
+  defp run_state_for_session_state("stopped"), do: "completed"
+  defp run_state_for_session_state(:failed), do: "failed"
+  defp run_state_for_session_state("failed"), do: "failed"
+  defp run_state_for_session_state(_session_state), do: "running"
+
+  defp run_error_for_session_state(:failed, stop_reason), do: stop_reason
+  defp run_error_for_session_state("failed", stop_reason), do: stop_reason
+  defp run_error_for_session_state(_session_state, _stop_reason), do: nil
 
   defp running_entry_session_id(%{session_id: session_id}) when is_binary(session_id),
     do: session_id

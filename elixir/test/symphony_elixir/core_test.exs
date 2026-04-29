@@ -1257,6 +1257,57 @@ defmodule SymphonyElixir.CoreTest do
     assert Enum.any?(stored_run["events"], &(&1["message"] == "durable issue session parked"))
   end
 
+  test "late codex updates do not reopen parked durable run rows" do
+    issue = %Issue{
+      id: "issue-late-park",
+      identifier: "GH-LATE-PARK",
+      title: "Late parked update",
+      state: "Human Review",
+      repo_id: "beacon",
+      number: 44,
+      pr_url: "https://github.com/devp1/Beacon/pull/44",
+      pr_state: "OPEN",
+      check_state: "none",
+      review_state: ""
+    }
+
+    assert {:ok, "run-late-park"} =
+             SymphonyElixir.Storage.start_run(%{
+               id: "run-late-park",
+               repo_id: issue.repo_id,
+               issue_number: issue.number,
+               issue_identifier: issue.identifier,
+               state: "parked",
+               session_state: "parked",
+               health: ["parked"],
+               error: nil
+             })
+
+    SymphonyElixir.RunLedger.persist_codex_update(
+      %{
+        run_id: "run-late-park",
+        issue: issue,
+        session_state: :parked,
+        health: ["parked"],
+        stop_reason: "human_review",
+        workspace_path: "/tmp/symphony-late-park",
+        session_id: "thread-late-turn-late",
+        issue_session_id: "issue-session-late-park",
+        thread_id: "thread-late",
+        turn_count: 1,
+        last_codex_message: %{event: :notification, message: %{"method" => "turn/completed"}}
+      },
+      %{event: "late codex notification"}
+    )
+
+    stored_run = SymphonyElixir.Storage.get_run("run-late-park")
+
+    assert stored_run["state"] == "parked"
+    assert stored_run["session_state"] == "parked"
+    assert is_nil(stored_run["error"])
+    assert stored_run["pr_url"] == "https://github.com/devp1/Beacon/pull/44"
+  end
+
   test "rerun_issue moves an operator-paused issue back to in-progress and clears local pause state" do
     previous_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
 

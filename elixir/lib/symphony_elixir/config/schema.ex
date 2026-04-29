@@ -78,6 +78,38 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule GitHub do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:builder_token, :string)
+      field(:reviewer_token, :string)
+      field(:review_check_name, :string, default: "symphony/autonomous-review")
+      field(:required_check_names, {:array, :string}, default: [])
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:builder_token, :reviewer_token, :review_check_name, :required_check_names], empty_values: [])
+      |> validate_required([:review_check_name])
+      |> update_change(:required_check_names, &normalize_check_names/1)
+    end
+
+    defp normalize_check_names(names) when is_list(names) do
+      names
+      |> Enum.map(&to_string/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+    end
+
+    defp normalize_check_names(_names), do: []
+  end
+
   defmodule Repo do
     @moduledoc false
     use Ecto.Schema
@@ -298,6 +330,41 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Evidence do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: true)
+      field(:force_labels, {:array, :string}, default: ["evidence-required"])
+      field(:skip_labels, {:array, :string}, default: ["evidence-skip"])
+      field(:review_gate, :string, default: "blocking")
+      field(:max_review_attempts, :integer, default: 2)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:enabled, :force_labels, :skip_labels, :review_gate, :max_review_attempts], empty_values: [])
+      |> validate_inclusion(:review_gate, ["blocking", "advisory", "off"])
+      |> validate_number(:max_review_attempts, greater_than: 0)
+      |> update_change(:force_labels, &normalize_labels/1)
+      |> update_change(:skip_labels, &normalize_labels/1)
+    end
+
+    defp normalize_labels(labels) when is_list(labels) do
+      labels
+      |> Enum.map(&to_string/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+    end
+
+    defp normalize_labels(_labels), do: []
+  end
+
   defmodule Server do
     @moduledoc false
     use Ecto.Schema
@@ -338,6 +405,7 @@ defmodule SymphonyElixir.Config.Schema do
     field(:runtime_profile, :string, default: "default")
     embeds_many(:repos, Repo, on_replace: :delete)
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:github, GitHub, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
@@ -345,6 +413,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:evidence, Evidence, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
     embeds_one(:storage, Storage, on_replace: :update, defaults_to_struct: true)
   end
@@ -447,6 +516,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> validate_inclusion(:runtime_profile, ["default", "local_trusted"])
     |> cast_embed(:repos, with: &Repo.changeset/2)
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
+    |> cast_embed(:github, with: &GitHub.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
     |> cast_embed(:worker, with: &Worker.changeset/2)
@@ -454,6 +524,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
+    |> cast_embed(:evidence, with: &Evidence.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
     |> cast_embed(:storage, with: &Storage.changeset/2)
   end
@@ -467,6 +538,20 @@ defmodule SymphonyElixir.Config.Schema do
             System.get_env("LINEAR_API_KEY") || System.get_env("GITHUB_TOKEN") || System.get_env("GH_TOKEN")
           ),
         assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+    }
+
+    github = %{
+      settings.github
+      | builder_token:
+          resolve_secret_setting(
+            settings.github.builder_token,
+            System.get_env("SYMPHONY_GITHUB_BUILDER_TOKEN") || settings.tracker.api_key || System.get_env("GITHUB_TOKEN") || System.get_env("GH_TOKEN")
+          ),
+        reviewer_token:
+          resolve_secret_setting(
+            settings.github.reviewer_token,
+            System.get_env("SYMPHONY_GITHUB_REVIEWER_TOKEN")
+          )
     }
 
     workspace = %{
@@ -490,7 +575,7 @@ defmodule SymphonyElixir.Config.Schema do
       | sqlite_path: resolve_path_value(settings.storage.sqlite_path, Path.join([File.cwd!(), "symphony.sqlite3"]))
     }
 
-    %{settings | repos: repos, tracker: tracker, workspace: workspace, codex: codex, storage: storage}
+    %{settings | repos: repos, tracker: tracker, github: github, workspace: workspace, codex: codex, storage: storage}
   end
 
   @spec default_github_labels() :: map()

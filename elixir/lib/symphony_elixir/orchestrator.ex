@@ -70,6 +70,7 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil
     }
 
+    preserve_human_review_storage_runs()
     interrupt_stale_storage_runs()
     interrupt_stale_issue_sessions()
     run_terminal_workspace_cleanup()
@@ -430,6 +431,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
     should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec preserve_human_review_storage_for_test() :: :ok
+  def preserve_human_review_storage_for_test do
+    preserve_human_review_storage_runs()
   end
 
   @doc false
@@ -1998,7 +2005,8 @@ defmodule SymphonyElixir.Orchestrator do
     _ -> nil
   end
 
-  defp recoverable_issue_session_match?(%{"state" => "interrupted-resumable"} = session, %Issue{} = issue) do
+  defp recoverable_issue_session_match?(%{"state" => state} = session, %Issue{} = issue)
+       when state in ["interrupted-resumable", "parked"] do
     same_repo_issue_number?(session, issue) or same_issue_identifier?(session, issue)
   end
 
@@ -2347,6 +2355,159 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
+
+  defp preserve_human_review_storage_runs do
+    case Tracker.fetch_issues_by_states(["Human Review", "human-review"]) do
+      {:ok, issues} ->
+        runs = Storage.list_runs(500)
+        issue_sessions = Storage.list_issue_sessions()
+
+        Enum.each(issues, fn
+          %Issue{} = issue -> preserve_human_review_storage_for_issue(issue, runs, issue_sessions)
+          _issue -> :ok
+        end)
+
+      {:error, reason} ->
+        Logger.warning("Skipping startup human-review recovery; failed to fetch review-ready issues: #{inspect(reason)}")
+    end
+  end
+
+  defp preserve_human_review_storage_for_issue(%Issue{} = issue, runs, issue_sessions)
+       when is_list(runs) and is_list(issue_sessions) do
+    matching_runs =
+      Enum.filter(runs, fn run ->
+        startup_recoverable_run?(run) and storage_row_matches_issue?(run, issue)
+      end)
+
+    Enum.each(matching_runs, &park_human_review_storage_run(&1, issue, issue_sessions))
+
+    matching_run_session_ids =
+      matching_runs
+      |> Enum.flat_map(fn
+        %{"issue_session_id" => issue_session_id} when is_binary(issue_session_id) -> [issue_session_id]
+        _run -> []
+      end)
+      |> MapSet.new()
+
+    issue_sessions
+    |> Enum.filter(&storage_row_matches_issue?(&1, issue))
+    |> Enum.reject(&(Map.get(&1, "id") in matching_run_session_ids))
+    |> Enum.each(&park_human_review_issue_session(&1))
+  end
+
+  defp park_human_review_storage_run(%{"id" => run_id} = run, %Issue{} = issue, issue_sessions)
+       when is_binary(run_id) and is_list(issue_sessions) do
+    issue_session = issue_session_for_run(run, issue_sessions)
+    issue_session_id = Map.get(run, "issue_session_id") || Map.get(issue_session || %{}, "id")
+    parked_at = DateTime.utc_now()
+
+    RunLedger.park_issue_session(
+      %{
+        run_id: run_id,
+        issue_session_id: issue_session_id,
+        issue: issue,
+        workspace_path: Map.get(run, "workspace_path") || Map.get(issue_session || %{}, "workspace_path"),
+        thread_id: Map.get(run, "thread_id") || Map.get(issue_session || %{}, "codex_thread_id"),
+        turn_count: Map.get(run, "turn_count") || 0,
+        health: ["parked"],
+        stop_reason: "human_review"
+      },
+      parked_at
+    )
+
+    _ = Storage.update_issue_session(issue_session_id, %{app_server_pid: nil})
+
+    _ =
+      Storage.append_event(run_id, "info", "startup recovery preserved human-review handoff", %{
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        issue_session_id: issue_session_id,
+        pr_url: issue.pr_url
+      })
+
+    :ok
+  end
+
+  defp park_human_review_storage_run(_run, _issue, _issue_sessions), do: :ok
+
+  defp startup_recoverable_run?(%{"state" => "running"}), do: true
+
+  defp startup_recoverable_run?(%{"state" => "cancelled", "error" => reason}) do
+    startup_interruption_reason?(reason)
+  end
+
+  defp startup_recoverable_run?(_run), do: false
+
+  defp park_human_review_issue_session(%{"id" => issue_session_id} = issue_session)
+       when is_binary(issue_session_id) do
+    if startup_recoverable_issue_session?(issue_session) do
+      parked_at = Map.get(issue_session, "parked_at") || timestamp()
+
+      _ =
+        Storage.update_issue_session(issue_session_id, %{
+          state: "parked",
+          app_server_pid: nil,
+          health: ["parked"],
+          parked_at: parked_at,
+          stop_reason: "human_review"
+        })
+    end
+
+    :ok
+  end
+
+  defp park_human_review_issue_session(_issue_session), do: :ok
+
+  defp startup_recoverable_issue_session?(%{"state" => state})
+       when state in ["starting", "running", "parked"],
+       do: true
+
+  defp startup_recoverable_issue_session?(%{"state" => "interrupted-resumable", "stop_reason" => reason}) do
+    startup_interruption_reason?(reason)
+  end
+
+  defp startup_recoverable_issue_session?(_issue_session), do: false
+
+  defp startup_interruption_reason?(reason) when is_binary(reason) do
+    String.starts_with?(reason, "interrupted on Symphony startup")
+  end
+
+  defp startup_interruption_reason?(_reason), do: false
+
+  defp issue_session_for_run(run, issue_sessions) when is_map(run) and is_list(issue_sessions) do
+    issue_session_id = Map.get(run, "issue_session_id")
+
+    Enum.find(issue_sessions, &(is_binary(issue_session_id) and Map.get(&1, "id") == issue_session_id)) ||
+      Enum.find(issue_sessions, &storage_rows_match?(&1, run))
+  end
+
+  defp storage_row_matches_issue?(row, %Issue{} = issue) when is_map(row) do
+    same_repo_issue_number?(row, issue) or same_issue_identifier?(row, issue) or Map.get(row, "issue_identifier") == issue.id
+  end
+
+  defp storage_row_matches_issue?(_row, _issue), do: false
+
+  defp storage_rows_match?(left, right) when is_map(left) and is_map(right) do
+    same_storage_repo_issue_number?(left, right) or same_storage_issue_identifier?(left, right)
+  end
+
+  defp storage_rows_match?(_left, _right), do: false
+
+  defp same_storage_repo_issue_number?(left, right) do
+    is_binary(Map.get(left, "repo_id")) and is_integer(Map.get(left, "issue_number")) and
+      Map.get(left, "repo_id") == Map.get(right, "repo_id") and
+      Map.get(left, "issue_number") == Map.get(right, "issue_number")
+  end
+
+  defp same_storage_issue_identifier?(left, right) do
+    is_binary(Map.get(left, "issue_identifier")) and Map.get(left, "issue_identifier") == Map.get(right, "issue_identifier")
+  end
+
+  defp timestamp do
+    DateTime.utc_now()
+    |> DateTime.truncate(:second)
+    |> DateTime.to_iso8601()
+  end
 
   defp run_terminal_workspace_cleanup do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do

@@ -1,6 +1,34 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  defmodule FakeCodingAgentAdapter do
+    @behaviour SymphonyElixir.CodingAgent.Adapter
+
+    @impl true
+    def run(role, workspace, prompt, issue, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:coding_agent_adapter_run, role, workspace, prompt, issue.identifier})
+      {:ok, %{session_id: "fake-session", thread_id: "fake-thread"}}
+    end
+
+    @impl true
+    def start_session(role, workspace, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:coding_agent_start_session, role, workspace})
+      {:ok, %{thread_id: "fake-thread"}}
+    end
+
+    @impl true
+    def run_turn(role, session, prompt, issue, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:coding_agent_run_turn, role, session.thread_id, prompt, issue.identifier})
+      {:ok, %{session_id: "fake-turn", thread_id: session.thread_id}}
+    end
+
+    @impl true
+    def stop_session(role, session, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:coding_agent_stop_session, role, session.thread_id})
+      :ok
+    end
+  end
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -17,11 +45,20 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
+    assert config.github.builder_token == nil
+    assert config.github.reviewer_token == nil
+    assert config.github.review_check_name == "symphony/autonomous-review"
+    assert config.github.required_check_names == []
     assert config.agent.max_turns == 20
     assert config.agent.artifact_nudge_tokens == 250_000
     assert config.agent.max_artifact_nudges == 1
     assert config.agent.max_tokens_before_first_artifact == 200_000
     assert config.agent.max_tokens_without_artifact == 250_000
+    assert config.evidence.enabled == true
+    assert config.evidence.force_labels == ["evidence-required"]
+    assert config.evidence.skip_labels == ["evidence-skip"]
+    assert config.evidence.review_gate == "blocking"
+    assert config.evidence.max_review_attempts == 2
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -81,6 +118,37 @@ defmodule SymphonyElixir.CoreTest do
     write_workflow_file!(Workflow.workflow_file_path(), max_tokens_before_first_artifact: -1)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "agent.max_tokens_before_first_artifact"
+
+    write_workflow_file!(Workflow.workflow_file_path(), evidence_review_gate: "advisory")
+    assert Config.settings!().evidence.review_gate == "advisory"
+
+    write_workflow_file!(Workflow.workflow_file_path(), evidence_review_gate: "nope")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "evidence.review_gate"
+
+    write_workflow_file!(Workflow.workflow_file_path(), evidence_max_review_attempts: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "evidence.max_review_attempts"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      github_builder_token: "builder-token",
+      github_reviewer_token: "reviewer-token",
+      github_review_check_name: "symphony/review",
+      github_required_check_names: ["test", " test ", ""]
+    )
+
+    assert Config.settings!().github.builder_token == "builder-token"
+    assert Config.settings!().github.reviewer_token == "reviewer-token"
+    assert Config.settings!().github.review_check_name == "symphony/review"
+    assert Config.settings!().github.required_check_names == ["test"]
+    assert Config.independent_github_reviewer?()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      github_builder_token: "same-token",
+      github_reviewer_token: "same-token"
+    )
+
+    refute Config.independent_github_reviewer?()
 
     write_workflow_file!(Workflow.workflow_file_path(), runtime_profile: "too_trusting")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -160,6 +228,256 @@ defmodule SymphonyElixir.CoreTest do
 
     assert :ok = Config.validate!()
     assert Tracker.adapter() == SymphonyElixir.GitHub.Adapter
+  end
+
+  test "coding agent delegates roles through the configured adapter" do
+    issue = %Issue{id: "issue-1", identifier: "GH-1", title: "Adapter boundary", state: "In Progress"}
+
+    assert {:ok, %{session_id: "fake-session", thread_id: "fake-thread"}} =
+             SymphonyElixir.CodingAgent.run(:reviewer, "/tmp/workspace", "review evidence", issue,
+               adapter: FakeCodingAgentAdapter,
+               test_pid: self()
+             )
+
+    assert_receive {:coding_agent_adapter_run, :reviewer, "/tmp/workspace", "review evidence", "GH-1"}
+
+    assert {:ok, session} =
+             SymphonyElixir.CodingAgent.start_session(:executor, "/tmp/workspace",
+               adapter: FakeCodingAgentAdapter,
+               test_pid: self()
+             )
+
+    assert_receive {:coding_agent_start_session, :executor, "/tmp/workspace"}
+
+    assert {:ok, %{session_id: "fake-turn", thread_id: "fake-thread"}} =
+             SymphonyElixir.CodingAgent.run_turn(:executor, session, "continue", issue,
+               adapter: FakeCodingAgentAdapter,
+               test_pid: self()
+             )
+
+    assert_receive {:coding_agent_run_turn, :executor, "fake-thread", "continue", "GH-1"}
+
+    assert :ok =
+             SymphonyElixir.CodingAgent.stop_session(:executor, session,
+               adapter: FakeCodingAgentAdapter,
+               test_pid: self()
+             )
+
+    assert_receive {:coding_agent_stop_session, :executor, "fake-thread"}
+
+    assert {:error, {:unsupported_agent_role, :planner}} =
+             SymphonyElixir.CodingAgent.run(:planner, "/tmp/workspace", "plan", issue,
+               adapter: FakeCodingAgentAdapter,
+               test_pid: self()
+             )
+  end
+
+  test "autonomous review normalizes verdicts and gates merge readiness" do
+    issue = %Issue{
+      id: "beacon#25",
+      identifier: "GH-25",
+      title: "PR-ready handoff",
+      state: "Human Review",
+      repo_id: "beacon",
+      number: 25,
+      pr_url: "https://github.com/devp1/Beacon/pull/25",
+      pr_number: 25,
+      pr_state: "OPEN",
+      head_sha: "abc123",
+      check_state: "passing"
+    }
+
+    assert SymphonyElixir.AutonomousReview.normalize_verdict("fail") == "request_changes"
+    assert SymphonyElixir.AutonomousReview.check_conclusion(:needs_input) == "action_required"
+
+    assert %{ready?: true, reasons: [], review_verdict: "pass", review_stale?: false} =
+             SymphonyElixir.AutonomousReview.merge_gate(issue, %{verdict: "pass", head_sha: "abc123"})
+
+    assert %{ready?: false, reasons: reasons, review_stale?: true} =
+             SymphonyElixir.AutonomousReview.merge_gate(%{issue | check_state: "pending"}, %{
+               verdict: "pass",
+               head_sha: "old-sha"
+             })
+
+    assert "ci-not-green" in reasons
+    assert "autonomous-review-stale" in reasons
+
+    assert {:ok, _review_id} =
+             SymphonyElixir.AutonomousReview.record(issue, %{
+               run_id: "run-review",
+               verdict: :pass,
+               summary: "clean",
+               head_sha: "abc123"
+             })
+
+    assert [%{"run_id" => "run-review", "verdict" => "pass", "stale" => 0} | _] =
+             SymphonyElixir.Storage.list_autonomous_reviews()
+  end
+
+  test "handoff parser normalizes evidence metadata" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-handoff-evidence-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(Path.join(workspace, ".symphony"))
+
+      File.write!(
+        Path.join([workspace, ".symphony", "handoff.json"]),
+        Jason.encode!(%{
+          ready: true,
+          state: "human-review",
+          pr_url: "https://github.com/devp1/Beacon/pull/22",
+          evidence: %{
+            required: true,
+            bundlePath: ".symphony/evidence/run-1/manifest.json",
+            reason: "dashboard flow changed"
+          }
+        })
+      )
+
+      assert {:ok,
+              %{
+                state: "human-review",
+                tracker_state: "Human Review",
+                evidence: %{
+                  required: true,
+                  bundle_path: ".symphony/evidence/run-1/manifest.json",
+                  reason: "dashboard flow changed"
+                }
+              } = handoff} = SymphonyElixir.Handoff.read(workspace)
+
+      assert SymphonyElixir.Handoff.storage_payload(handoff).evidence.required == true
+    after
+      File.rm_rf(workspace)
+    end
+  end
+
+  test "evidence bundle loader validates and normalizes inspectable manifest entries" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-evidence-manifest-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      bundle_dir = Path.join([workspace, ".symphony", "evidence", "run-1"])
+      File.mkdir_p!(bundle_dir)
+      File.write!(Path.join(bundle_dir, "trace.zip"), "trace bytes\n")
+      File.write!(Path.join(bundle_dir, "npm-test.log"), "test output\n")
+
+      File.write!(
+        Path.join(bundle_dir, "manifest.json"),
+        Jason.encode!(%{
+          schema_version: "symphony.evidence.v1",
+          summary: "Settings flow is covered by trace and test output.",
+          artifacts: [
+            %{
+              kind: "playwright-trace",
+              label: "Settings flow trace",
+              path: "trace.zip"
+            }
+          ],
+          commands: [
+            %{
+              command: "npm test",
+              status: "passed",
+              exit_code: 0,
+              output_path: "npm-test.log"
+            }
+          ],
+          changed_files: ["lib/settings.ex"]
+        })
+      )
+
+      assert {:ok, bundle} =
+               SymphonyElixir.Evidence.load_bundle(workspace, %{
+                 required: true,
+                 bundle_path: ".symphony/evidence/run-1"
+               })
+
+      assert bundle.manifest["schema_version"] == "symphony.evidence.v1"
+      assert bundle.manifest["summary"] == "Settings flow is covered by trace and test output."
+
+      assert [
+               %{
+                 "kind" => "playwright-trace",
+                 "path" => "trace.zip",
+                 "workspace_path" => ".symphony/evidence/run-1/trace.zip"
+               }
+             ] = bundle.manifest["artifacts"]
+
+      assert [
+               %{
+                 "command" => "npm test",
+                 "status" => "passed",
+                 "exit_code" => 0,
+                 "output_path" => "npm-test.log",
+                 "workspace_output_path" => ".symphony/evidence/run-1/npm-test.log"
+               }
+             ] = bundle.manifest["commands"]
+    after
+      File.rm_rf(workspace)
+    end
+  end
+
+  test "evidence bundle loader rejects summary-only or escaped manifest entries" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-evidence-manifest-invalid-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      bundle_dir = Path.join([workspace, ".symphony", "evidence", "run-1"])
+      outside_log = Path.join(test_root, "outside.log")
+
+      File.mkdir_p!(bundle_dir)
+      File.write!(outside_log, "outside\n")
+
+      manifest_path = Path.join(bundle_dir, "manifest.json")
+
+      File.write!(
+        manifest_path,
+        Jason.encode!(%{
+          schema_version: "symphony.evidence.v1",
+          summary: "No concrete proof yet."
+        })
+      )
+
+      assert {:error, {:invalid_evidence_manifest, errors}} =
+               SymphonyElixir.Evidence.load_bundle(workspace, %{
+                 required: true,
+                 bundle_path: ".symphony/evidence/run-1"
+               })
+
+      assert :missing_proof_entries in errors
+
+      File.write!(
+        manifest_path,
+        Jason.encode!(%{
+          schema_version: "symphony.evidence.v1",
+          summary: "Escaped path should not validate.",
+          artifacts: [%{kind: "log", path: outside_log}]
+        })
+      )
+
+      assert {:error, {:invalid_evidence_manifest, errors}} =
+               SymphonyElixir.Evidence.load_bundle(workspace, %{
+                 required: true,
+                 bundle_path: ".symphony/evidence/run-1"
+               })
+
+      assert Enum.any?(errors, fn
+               {{:artifact_path, 0}, {:path_escape, _escaped_path, _workspace_root}} -> true
+               _error -> false
+             end)
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "local trusted runtime profile grants full local access but keeps remote scoped" do
@@ -291,6 +609,48 @@ defmodule SymphonyElixir.CoreTest do
 
     assert :ok = SymphonyElixir.Storage.append_event(run_id, "info", "started", %{tokens: 0})
     assert :ok = SymphonyElixir.Storage.put_artifact(run_id, %{kind: "log", path: "/tmp/log.txt", label: "log"})
+
+    assert {:ok, bundle_id} =
+             SymphonyElixir.Storage.upsert_evidence_bundle(%{
+               run_id: run_id,
+               issue_session_id: "issue-session-10",
+               issue_identifier: "beacon-10",
+               workspace_path: "/tmp/beacon/GH-10",
+               manifest_path: "/tmp/beacon/GH-10/.symphony/evidence/manifest.json",
+               required: true,
+               status: "review_passed",
+               verdict: "pass",
+               summary: "trace covers the changed flow"
+             })
+
+    assert {:ok, _review_id} =
+             SymphonyElixir.Storage.record_evidence_review(%{
+               bundle_id: bundle_id,
+               run_id: run_id,
+               issue_session_id: "issue-session-10",
+               attempt: 1,
+               verdict: "pass",
+               summary: "sufficient evidence",
+               feedback: %{concerns: []},
+               output_path: "/tmp/beacon/GH-10/.symphony/evidence/reviews/review.json"
+             })
+
+    assert {:ok, autonomous_review_id} =
+             SymphonyElixir.Storage.record_autonomous_review(%{
+               run_id: run_id,
+               issue_session_id: "issue-session-10",
+               repo_id: "beacon",
+               issue_number: 10,
+               issue_identifier: "beacon-10",
+               pr_url: "https://github.com/devp1/Beacon/pull/11",
+               head_sha: "abc123",
+               verdict: "pass",
+               summary: "ready for human review",
+               findings: [],
+               check_name: "symphony/autonomous-review",
+               check_conclusion: "success"
+             })
+
     assert :ok = SymphonyElixir.Storage.update_run(run_id, %{state: "human_review", pr_url: "https://github.com/devp1/Beacon/pull/11"})
 
     assert [%{"id" => "beacon"}] = SymphonyElixir.Storage.list_repos()
@@ -309,8 +669,17 @@ defmodule SymphonyElixir.CoreTest do
 
     assert [%{"id" => ^run_id, "state" => "human_review"} | _] = SymphonyElixir.Storage.list_runs()
 
-    assert %{"events" => [%{"message" => "started", "data" => %{"tokens" => 0}}]} =
+    assert %{
+             "events" => [%{"message" => "started", "data" => %{"tokens" => 0}}],
+             "evidence_bundles" => [%{"id" => ^bundle_id, "status" => "review_passed", "verdict" => "pass"}],
+             "evidence_reviews" => [%{"bundle_id" => ^bundle_id, "verdict" => "pass"}],
+             "autonomous_reviews" => [%{"id" => ^autonomous_review_id, "verdict" => "pass", "check_conclusion" => "success"}]
+           } =
              SymphonyElixir.Storage.get_run(run_id)
+
+    assert [%{"id" => ^bundle_id, "status" => "review_passed"} | _] = SymphonyElixir.Storage.list_evidence_bundles()
+    assert [%{"bundle_id" => ^bundle_id, "verdict" => "pass"} | _] = SymphonyElixir.Storage.list_evidence_reviews()
+    assert [%{"id" => ^autonomous_review_id, "verdict" => "pass"} | _] = SymphonyElixir.Storage.list_autonomous_reviews()
   end
 
   test "sqlite storage marks stale running runs interrupted on startup recovery" do
@@ -344,7 +713,7 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, 0} = SymphonyElixir.Storage.interrupt_running_runs("test startup recovery")
   end
 
-  test "sqlite storage marks stale issue sessions resumable on startup recovery" do
+  test "sqlite storage marks stale active issue sessions resumable on startup recovery" do
     assert {:ok, stale_session_id} =
              SymphonyElixir.Storage.start_issue_session(%{
                repo_id: "beacon",
@@ -365,7 +734,7 @@ defmodule SymphonyElixir.CoreTest do
                state: "parked"
              })
 
-    assert {:ok, 2} = SymphonyElixir.Storage.interrupt_running_issue_sessions("test startup recovery")
+    assert {:ok, 1} = SymphonyElixir.Storage.interrupt_running_issue_sessions("test startup recovery")
 
     sessions = SymphonyElixir.Storage.list_issue_sessions()
 
@@ -377,13 +746,129 @@ defmodule SymphonyElixir.CoreTest do
            } = Enum.find(sessions, &(&1["id"] == stale_session_id))
 
     assert %{
-             "state" => "interrupted-resumable",
-             "stop_reason" => "test startup recovery",
-             "health" => ["interrupted-resumable"],
+             "state" => "parked",
+             "stop_reason" => nil,
+             "health" => ["healthy"],
              "codex_thread_id" => "thread-11"
            } = Enum.find(sessions, &(&1["id"] == parked_session_id))
 
     assert {:ok, 0} = SymphonyElixir.Storage.interrupt_running_issue_sessions("test startup recovery")
+  end
+
+  test "startup recovery preserves review-ready stale runs as parked handoffs" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue = %Issue{
+      id: "beacon#18",
+      identifier: "GH-18",
+      title: "Review-ready dogfood issue",
+      state: "Human Review",
+      repo_id: "beacon",
+      number: 18,
+      pr_url: "https://github.com/devp1/Beacon/pull/22",
+      pr_state: "OPEN",
+      check_state: "none",
+      review_state: ""
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    assert {:ok, "issue-session-review-ready"} =
+             SymphonyElixir.Storage.start_issue_session(%{
+               id: "issue-session-review-ready",
+               repo_id: "beacon",
+               issue_number: 18,
+               issue_identifier: "GH-18",
+               workspace_path: "/tmp/beacon/GH-18",
+               codex_thread_id: "thread-18",
+               app_server_pid: "12345",
+               state: "running",
+               current_run_id: "run-review-ready"
+             })
+
+    assert {:ok, "run-review-ready"} =
+             SymphonyElixir.Storage.start_run(%{
+               id: "run-review-ready",
+               repo_id: "beacon",
+               issue_number: 18,
+               issue_identifier: "GH-18",
+               issue_session_id: "issue-session-review-ready",
+               state: "running",
+               workspace_path: "/tmp/beacon/GH-18",
+               thread_id: "thread-18",
+               turn_count: 3,
+               session_state: "running",
+               health: ["healthy"]
+             })
+
+    assert {:ok, "issue-session-review-ready-interrupted"} =
+             SymphonyElixir.Storage.start_issue_session(%{
+               id: "issue-session-review-ready-interrupted",
+               repo_id: "beacon",
+               issue_number: 18,
+               issue_identifier: "GH-18",
+               workspace_path: "/tmp/beacon/GH-18",
+               codex_thread_id: "thread-18b",
+               app_server_pid: "67890",
+               state: "interrupted-resumable",
+               current_run_id: "run-review-ready-interrupted",
+               stop_reason: "interrupted on Symphony startup; Codex app-server thread did not survive daemon restart",
+               health: ["interrupted-resumable"]
+             })
+
+    assert {:ok, "run-review-ready-interrupted"} =
+             SymphonyElixir.Storage.start_run(%{
+               id: "run-review-ready-interrupted",
+               repo_id: "beacon",
+               issue_number: 18,
+               issue_identifier: "GH-18",
+               issue_session_id: "issue-session-review-ready-interrupted",
+               state: "cancelled",
+               error: "interrupted on Symphony startup before live worker recovery",
+               workspace_path: "/tmp/beacon/GH-18",
+               thread_id: "thread-18b",
+               turn_count: 4,
+               session_state: "running",
+               health: ["interrupted-resumable"]
+             })
+
+    assert :ok = Orchestrator.preserve_human_review_storage_for_test()
+    assert {:ok, 0} = SymphonyElixir.Storage.interrupt_running_runs("test startup recovery")
+    assert {:ok, 0} = SymphonyElixir.Storage.interrupt_running_issue_sessions("test startup recovery")
+
+    stored_run = SymphonyElixir.Storage.get_run("run-review-ready")
+
+    assert stored_run["state"] == "parked"
+    assert stored_run["session_state"] == "parked"
+    assert stored_run["error"] == nil
+    assert stored_run["pr_url"] == "https://github.com/devp1/Beacon/pull/22"
+    assert Enum.any?(stored_run["events"], &(&1["message"] == "startup recovery preserved human-review handoff"))
+
+    stored_interrupted_run = SymphonyElixir.Storage.get_run("run-review-ready-interrupted")
+
+    assert stored_interrupted_run["state"] == "parked"
+    assert stored_interrupted_run["session_state"] == "parked"
+    assert stored_interrupted_run["error"] == nil
+    assert stored_interrupted_run["pr_url"] == "https://github.com/devp1/Beacon/pull/22"
+
+    stored_session =
+      Enum.find(SymphonyElixir.Storage.list_issue_sessions(), &(&1["id"] == "issue-session-review-ready"))
+
+    assert stored_session["state"] == "parked"
+    assert stored_session["health"] == ["parked"]
+    assert stored_session["stop_reason"] == "human_review"
+    assert stored_session["app_server_pid"] == nil
+
+    stored_interrupted_session =
+      Enum.find(
+        SymphonyElixir.Storage.list_issue_sessions(),
+        &(&1["id"] == "issue-session-review-ready-interrupted")
+      )
+
+    assert stored_interrupted_session["state"] == "parked"
+    assert stored_interrupted_session["health"] == ["parked"]
+    assert stored_interrupted_session["stop_reason"] == "human_review"
+    assert stored_interrupted_session["app_server_pid"] == nil
   end
 
   test "current WORKFLOW.md file is valid and complete" do

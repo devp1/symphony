@@ -56,6 +56,8 @@ Important boundary:
   run ledger for audit history and dashboard state.
 - For trusted local GitHub runs, keep a durable issue session alive across implementation, PR
   handoff parking, and rework when the coding-agent protocol can support it.
+- Optionally gate PR-ready handoff with an agent-agnostic evidence bundle review so human reviewers
+  see proof artifacts and reviewer feedback before an issue parks at human review.
 
 ### 2.2 Non-Goals
 
@@ -103,7 +105,8 @@ Important boundary:
 6. `Issue Session` / `Agent Runner`
    - Creates workspace.
    - Builds prompt from issue + workflow template.
-   - Launches the coding agent app-server client.
+   - Launches the coding agent through an adapter boundary. The reference implementation uses Codex
+     app-server first, but executor/reviewer contracts SHOULD remain agent-agnostic where practical.
    - Streams agent updates back to the orchestrator.
    - In durable local profiles, owns one issue workspace, one app-server process, and one coding
      agent thread across multiple active work cycles.
@@ -113,6 +116,8 @@ Important boundary:
      operator-facing view).
    - SHOULD expose enough runtime identity to distinguish the running binary from the checkout,
      such as implementation version, build/source SHA when available, workflow path, and config path.
+   - A checked-out static runtime binary SHOULD fail fast or warn loudly when runtime source files
+     are newer than the binary, so dogfood runs do not silently use stale orchestration behavior.
 
 8. `Logging`
    - Emits structured runtime logs to one or more configured sinks.
@@ -638,6 +643,13 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
 - `repos`: list of GitHub repository configs when `tracker.kind=github`; preferred over legacy
   `tracker.owner` / `tracker.repo`
+- `github.builder_token`: optional string or `$VAR`; token for the GitHub builder identity that
+  owns issue labels/comments, branch updates, PR creation, and normal worker handoff
+- `github.reviewer_token`: optional string or `$VAR`; token for the independent GitHub reviewer
+  identity that owns autonomous review check runs, PR review comments, and approvals
+- `github.review_check_name`: string, default `symphony/autonomous-review`
+- `github.required_check_names`: list of strings, default `[]`; named CI checks the cockpit merge
+  gate may require in addition to the autonomous review check
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms`: integer, default `30000`
@@ -663,6 +675,14 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.semantic_inactivity_timeout_ms`: integer, default `1800000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `evidence.enabled`: boolean, default `true`
+- `evidence.force_labels`: list of issue labels that require an evidence bundle, default
+  `["evidence-required"]`
+- `evidence.skip_labels`: list of issue labels that skip evidence review, default
+  `["evidence-skip"]`
+- `evidence.review_gate`: string, default `blocking`; supported values are `blocking`, `advisory`,
+  and `off`
+- `evidence.max_review_attempts`: integer, default `2`
 
 ## 7. Orchestration State Machine
 
@@ -906,6 +926,50 @@ Part C: Tracker state refresh
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
 - If state refresh fails, keep workers running and try again on the next tick.
 
+Part D: Evidence review gate
+
+- A worker MAY include an `evidence` object in `.symphony/handoff.json` before requesting
+  `human-review`. Implementations SHOULD treat this as executor-declared proof metadata, not as a
+  tracker transition by itself.
+- `evidence.required: true` means the executor believes an evidence bundle is needed. Label/config
+  overrides MAY force or skip evidence independent of the executor declaration.
+- An evidence bundle SHOULD include a JSON manifest path, normally under `.symphony/evidence/`, with
+  paths to traces, screenshots, videos, logs, validation summaries, or other reviewable artifacts.
+- A v1 manifest SHOULD use `schema_version: "symphony.evidence.v1"`, a non-empty `summary`, and at
+  least one `artifacts` or `commands` entry. Relative local paths SHOULD resolve from the manifest
+  directory, MUST stay inside the issue workspace, and SHOULD exist before review. URL artifacts MAY
+  be used for externally hosted proof. Artifact kinds are intentionally extensible.
+- In a blocking gate, Symphony SHOULD run a separate review agent before applying the human-review
+  tracker transition. The review agent SHOULD have full repo read access and network access for PR
+  inspection, while writes are limited to its own review artifact output. Implementations SHOULD call
+  the reviewer through the same coding-agent adapter boundary used for executor turns, even when
+  Codex is the first/default adapter.
+- A passing review allows the existing handoff transition to proceed. A failing or missing bundle
+  SHOULD be fed back into the same durable executor thread so the worker can fix code, tests, or
+  evidence and write a fresh handoff marker.
+- After `evidence.max_review_attempts`, the issue SHOULD move to an operator-input state such as
+  `needs-input`, with a comment containing the run, workspace, PR, verdict, and review summary.
+- Review attempts, bundle metadata, verdicts, and feedback SHOULD be persisted in the local run
+  ledger/API/UI. Plain plans or narration are not evidence-bundle progress.
+
+Part E: Autonomous PR review and merge gate
+
+- After a PR-ready handoff, Symphony MAY run an autonomous reviewer through the coding-agent
+  boundary. Reviewer output MUST normalize to `pass`, `request_changes`, or `needs_input` plus a
+  short summary and actionable findings.
+- The reviewer identity SHOULD be independent from the builder identity. In GitHub mode this is
+  represented by separate builder and reviewer App tokens. Symphony MUST NOT hand those private
+  credentials to executor or reviewer agents; Symphony owns GitHub writes.
+- A reviewer `pass` MAY publish the `symphony/autonomous-review` check as `success`;
+  `request_changes` publishes `failure`; `needs_input` publishes `action_required`.
+- Symphony SHOULD refuse pass-style PR approvals when the configured reviewer token is missing or
+  equals the builder token. For Symphony-authored PRs, reviewer-requested changes SHOULD route the
+  issue/PR back to executor rework rather than letting the reviewer push directly to the builder
+  branch.
+- A PR is merge-eligible only when the PR is open, CI is green, the autonomous review verdict is
+  `pass`, and that review is not stale relative to the current PR head SHA. V1 may enforce this in
+  cockpit merge actions before branch protection is configured.
+
 ### 8.6 Startup Terminal Workspace Cleanup
 
 When the service starts:
@@ -1094,6 +1158,18 @@ Continuation processing:
   live thread using the targeted protocol.
 - The app-server subprocess SHOULD remain alive across those continuation turns and be stopped only
   when the worker run is ending.
+- Before a worker claims final handoff, it SHOULD write `.symphony/handoff.json` with `ready: true`
+  and a supported target state such as `human-review`, `needs-input`, `blocked`, or `done`.
+  Symphony MUST treat that file as a signal to apply and verify the tracker transition itself, not
+  as proof that the tracker already changed.
+- Local trusted durable sessions SHOULD preserve ready `.symphony/handoff.json` files across
+  restart/recovery, apply and verify them before launching another Codex turn, then clear the
+  marker only after the tracker transition is verified. Invalid or not-ready markers MAY be cleared
+  before an active work cycle. While a turn is active, local trusted sessions SHOULD watch for a
+  fresh ready marker, request Codex app-server `turn/interrupt`, wait for the interrupted
+  `turn/completed` event, then apply and verify the requested tracker transition through the normal
+  handoff path. Remote workers MAY keep the simpler post-turn handoff behavior until remote file
+  sentinels are implemented.
 
 Transport handling requirements:
 
@@ -1252,6 +1328,13 @@ Durable local issue-session behavior:
 6. `rework` resumes the same thread with compact rework guidance and lets the agent inspect issue,
    PR, checks, and repository state itself.
 7. Terminal/blocked/needs-input/cancelled states stop the session.
+8. If `.symphony/handoff.json` is present and ready after a turn, Symphony applies the requested
+   tracker state, refreshes the issue, and only parks/stops after the refreshed state matches the
+   requested state. A mismatch is a controller error; the worker must not be blindly continued as if
+   handoff succeeded.
+9. During local trusted turns, a ready `.symphony/handoff.json` marker interrupts the active turn
+   through Codex app-server `turn/interrupt`; session parking/stopping still happens only after the
+   app-server emits turn completion and the tracker state has been verified.
 
 Note:
 

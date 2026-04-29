@@ -11,8 +11,8 @@ defmodule SymphonyElixir.IssueSession do
   use GenServer
   require Logger
 
-  alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Storage, Tracker, Workpad, Workspace}
+  alias SymphonyElixir.{CodingAgent, Config, Evidence, Handoff, Linear.Issue, PromptBuilder}
+  alias SymphonyElixir.{Storage, Tracker, Workpad, Workspace}
 
   @type worker_host :: String.t() | nil
   @type session_state :: :starting | :running | :parked | :stopped | :failed
@@ -37,10 +37,10 @@ defmodule SymphonyElixir.IssueSession do
           opts: keyword(),
           worker_host: worker_host(),
           workspace: String.t() | nil,
-          app_session: AppServer.session() | nil,
+          app_session: CodingAgent.session() | nil,
           issue_session_id: String.t() | nil,
           run_id: String.t() | nil,
-          cycle_kind: :initial | :resume,
+          cycle_kind: :initial | :resume | :restart | {:evidence_feedback, String.t()},
           status: session_state(),
           turn_count: non_neg_integer()
         }
@@ -164,7 +164,32 @@ defmodule SymphonyElixir.IssueSession do
   end
 
   defp run_active_cycle(%__MODULE__{} = state) do
-    with {:ok, state} <- ensure_workspace(state),
+    with {:ok, state} <- ensure_workspace(state) do
+      case apply_startup_handoff(state) do
+        {:continue, state} ->
+          run_cycle_after_startup_handoff(state)
+
+        {:continue_with_prompt, state, prompt} ->
+          state
+          |> Map.put(:cycle_kind, {:evidence_feedback, prompt})
+          |> run_cycle_after_startup_handoff()
+
+        {:park, state, reason} ->
+          {:park, state, reason}
+
+        {:stop, state, reason} ->
+          {:stop, state, reason}
+
+        {:error, reason} ->
+          {:error, state, reason}
+      end
+    else
+      {:error, reason} -> {:error, state, reason}
+    end
+  end
+
+  defp run_cycle_after_startup_handoff(%__MODULE__{} = state) do
+    with :ok <- clear_stale_handoff(state),
          :ok <- Workspace.run_before_run_hook(state.workspace, state.issue, state.worker_host),
          :ok <- maybe_bootstrap_workpad(state.workspace, state.issue, state.worker_host),
          {:ok, state} <- ensure_app_session(state) do
@@ -177,6 +202,38 @@ defmodule SymphonyElixir.IssueSession do
       end
     else
       {:error, reason} -> {:error, state, reason}
+    end
+  end
+
+  defp apply_startup_handoff(%{workspace: workspace, worker_host: nil} = state)
+       when is_binary(workspace) do
+    case Handoff.read(workspace) do
+      {:ok, handoff} ->
+        case apply_verified_handoff(state, handoff) do
+          {:ok, state} -> classify_applied_startup_handoff(state)
+          {:continue_with_prompt, state, prompt} -> {:continue_with_prompt, state, prompt}
+          {:stop, state, reason} -> {:stop, state, reason}
+          {:error, reason} -> {:error, reason}
+        end
+
+      :missing ->
+        {:continue, state}
+
+      {:error, :handoff_not_ready} ->
+        {:continue, state}
+
+      {:error, _reason} ->
+        {:continue, state}
+    end
+  end
+
+  defp apply_startup_handoff(state), do: {:continue, state}
+
+  defp classify_applied_startup_handoff(%{issue: issue} = state) do
+    case classify_issue_state(issue) do
+      {:active, refreshed_issue} -> {:continue, %{state | issue: refreshed_issue}}
+      {:park, refreshed_issue} -> {:park, %{state | issue: refreshed_issue}, :human_review}
+      {:stop, refreshed_issue, reason} -> {:stop, %{state | issue: refreshed_issue}, reason}
     end
   end
 
@@ -253,7 +310,7 @@ defmodule SymphonyElixir.IssueSession do
   defp ensure_app_session(%{app_session: %{} = _app_session} = state), do: {:ok, state}
 
   defp ensure_app_session(%{workspace: workspace, worker_host: worker_host} = state) do
-    case AppServer.start_session(workspace,
+    case CodingAgent.start_session(:executor, workspace,
            worker_host: worker_host,
            resume_thread_id: Keyword.get(state.opts, :resume_thread_id)
          ) do
@@ -275,10 +332,60 @@ defmodule SymphonyElixir.IssueSession do
     end
   end
 
+  defp clear_stale_handoff(%{workspace: workspace, worker_host: nil} = state) when is_binary(workspace) do
+    handoff_path = Handoff.path(workspace)
+
+    case Handoff.read(workspace) do
+      {:ok, handoff} ->
+        _ =
+          Storage.append_event(state.run_id, "info", "preserved ready worker handoff file", %{
+            issue_session_id: state.issue_session_id,
+            handoff_path: handoff_path,
+            handoff: Handoff.storage_payload(handoff)
+          })
+
+        :ok
+
+      :missing ->
+        :ok
+
+      {:error, _reason} ->
+        remove_stale_handoff_file(state, handoff_path)
+    end
+  end
+
+  defp clear_stale_handoff(_state), do: :ok
+
+  defp remove_stale_handoff_file(state, handoff_path) do
+    if File.regular?(handoff_path) do
+      case File.rm(handoff_path) do
+        :ok ->
+          _ =
+            Storage.append_event(state.run_id, "info", "cleared stale worker handoff file", %{
+              issue_session_id: state.issue_session_id,
+              handoff_path: handoff_path
+            })
+
+          :ok
+
+        {:error, :enoent} ->
+          :ok
+
+        {:error, reason} ->
+          {:error, {:stale_handoff_cleanup_failed, reason}}
+      end
+    else
+      :ok
+    end
+  end
+
   defp run_turn_loop(%{app_session: app_session} = state, turn_number, max_turns) do
     prompt = build_turn_prompt(state.issue, state.opts, state.cycle_kind, turn_number, max_turns)
 
-    case AppServer.run_turn(app_session, prompt, state.issue, on_message: codex_message_handler(state.recipient, state.issue)) do
+    case CodingAgent.run_turn(:executor, app_session, prompt, state.issue,
+           on_message: codex_message_handler(state.recipient, state.issue),
+           turn_interrupt_sentinel: handoff_interrupt_sentinel(state)
+         ) do
       {:ok, turn_session} ->
         state = %{state | turn_count: state.turn_count + 1}
 
@@ -304,6 +411,27 @@ defmodule SymphonyElixir.IssueSession do
   end
 
   defp continue_after_turn(state, turn_number, max_turns) do
+    case maybe_apply_verified_handoff(state) do
+      {:ok, state} ->
+        continue_after_issue_status(state, turn_number, max_turns)
+
+      {:continue_with_prompt, state, prompt} when turn_number < max_turns ->
+        state
+        |> Map.put(:cycle_kind, {:evidence_feedback, prompt})
+        |> run_turn_loop(turn_number + 1, max_turns)
+
+      {:continue_with_prompt, state, _prompt} ->
+        {:park, state, :max_turns_reached}
+
+      {:stop, state, reason} ->
+        {:stop, state, reason}
+
+      {:error, reason} ->
+        {:error, state, reason}
+    end
+  end
+
+  defp continue_after_issue_status(state, turn_number, max_turns) do
     case issue_flow_status(state.issue, issue_state_fetcher(state.opts)) do
       {:active, refreshed_issue} when turn_number < max_turns ->
         run_turn_loop(%{state | issue: refreshed_issue, cycle_kind: :initial}, turn_number + 1, max_turns)
@@ -319,6 +447,378 @@ defmodule SymphonyElixir.IssueSession do
 
       {:error, reason} ->
         {:error, state, reason}
+    end
+  end
+
+  defp maybe_apply_verified_handoff(%{workspace: workspace} = state) when is_binary(workspace) do
+    case Handoff.read(workspace) do
+      {:ok, handoff} ->
+        apply_verified_handoff(state, handoff)
+
+      :missing ->
+        {:ok, state}
+
+      {:error, :handoff_not_ready} ->
+        {:ok, state}
+
+      {:error, reason} ->
+        {:error, {:invalid_handoff_file, reason}}
+    end
+  end
+
+  defp maybe_apply_verified_handoff(state), do: {:ok, state}
+
+  defp handoff_interrupt_sentinel(%{workspace: workspace, worker_host: nil} = state)
+       when is_binary(workspace) do
+    fn ->
+      case Handoff.read(workspace) do
+        {:ok, handoff} ->
+          {:interrupt, :worker_handoff_ready,
+           %{
+             issue_session_id: state.issue_session_id,
+             handoff: Handoff.storage_payload(handoff),
+             fingerprint: Handoff.fingerprint(handoff)
+           }}
+
+        _ ->
+          :continue
+      end
+    end
+  end
+
+  defp handoff_interrupt_sentinel(_state), do: nil
+
+  defp apply_verified_handoff(%{issue: %Issue{id: issue_id}} = state, handoff)
+       when is_binary(issue_id) do
+    target_state = Handoff.tracker_state(handoff)
+    payload = Handoff.storage_payload(handoff)
+
+    _ =
+      Storage.append_event(state.run_id, "info", "worker handoff file detected", %{
+        issue_session_id: state.issue_session_id,
+        handoff: payload
+      })
+
+    with {:ok, state} <- maybe_gate_human_review_handoff(state, handoff, target_state, payload),
+         :ok <- Tracker.update_issue_state(issue_id, target_state),
+         {:ok, refreshed_issue} <- fetch_single_issue_state(state),
+         :ok <- verify_handoff_state(refreshed_issue, target_state) do
+      _ = clear_verified_handoff_marker(state, payload)
+
+      _ =
+        Storage.append_event(state.run_id, "info", "worker handoff state verified", %{
+          issue_session_id: state.issue_session_id,
+          target_state: target_state,
+          observed_state: refreshed_issue.state,
+          handoff: payload
+        })
+
+      {:ok, %{state | issue: refreshed_issue}}
+    else
+      {:continue_with_prompt, state, prompt} ->
+        {:continue_with_prompt, state, prompt}
+
+      {:stop, state, reason} ->
+        {:stop, state, reason}
+
+      {:error, reason} ->
+        _ =
+          Storage.append_event(state.run_id, "error", "worker handoff state verification failed", %{
+            issue_session_id: state.issue_session_id,
+            target_state: target_state,
+            handoff: payload,
+            reason: inspect(reason)
+          })
+
+        {:error, {:handoff_state_verification_failed, reason}}
+    end
+  end
+
+  defp apply_verified_handoff(state, _handoff), do: {:ok, state}
+
+  defp clear_verified_handoff_marker(%{workspace: workspace} = state, payload) when is_binary(workspace) do
+    case remove_handoff_marker(state) do
+      :ok ->
+        _ =
+          Storage.append_event(state.run_id, "info", "cleared verified worker handoff file", %{
+            issue_session_id: state.issue_session_id,
+            handoff_path: Handoff.path(workspace),
+            handoff: payload
+          })
+
+        :ok
+
+      {:error, reason} ->
+        _ =
+          Storage.append_event(state.run_id, "warning", "verified worker handoff cleanup failed", %{
+            issue_session_id: state.issue_session_id,
+            handoff_path: Handoff.path(workspace),
+            reason: inspect(reason)
+          })
+
+        :ok
+    end
+  end
+
+  defp clear_verified_handoff_marker(_state, _payload), do: :ok
+
+  defp maybe_gate_human_review_handoff(state, handoff, "Human Review", payload) do
+    decision = Evidence.decision(state.workspace, state.issue, handoff)
+    attempt = Evidence.next_attempt(state.run_id)
+    bundle_id = "evidence-bundle-#{state.run_id || "unknown"}-#{attempt}"
+
+    _ =
+      Storage.upsert_evidence_bundle(%{
+        id: bundle_id,
+        run_id: state.run_id,
+        issue_session_id: state.issue_session_id,
+        issue_identifier: state.issue.identifier,
+        workspace_path: state.workspace,
+        manifest_path: Map.get(decision, :manifest_path) || Map.get(decision, :bundle_path),
+        required: decision.required,
+        status: decision.status,
+        reason: decision.reason
+      })
+
+    cond do
+      not decision.required ->
+        _ =
+          Storage.append_event(state.run_id, "info", "evidence gate skipped", %{
+            issue_session_id: state.issue_session_id,
+            evidence: decision,
+            handoff: payload
+          })
+
+        {:ok, state}
+
+      not Evidence.blocking?(decision) ->
+        _ =
+          Storage.append_event(state.run_id, "info", "evidence gate recorded as advisory", %{
+            issue_session_id: state.issue_session_id,
+            evidence: decision,
+            handoff: payload
+          })
+
+        {:ok, state}
+
+      true ->
+        run_blocking_evidence_gate(state, handoff, decision, bundle_id, attempt)
+    end
+  end
+
+  defp maybe_gate_human_review_handoff(state, _handoff, _target_state, _payload), do: {:ok, state}
+
+  defp run_blocking_evidence_gate(state, handoff, decision, bundle_id, attempt) do
+    case Evidence.load_bundle(state.workspace, decision) do
+      {:ok, bundle} ->
+        _ = Storage.put_artifact(state.run_id, %{kind: "evidence_manifest", path: bundle.manifest_path, label: "evidence manifest"})
+
+        review_runner =
+          Keyword.get(state.opts, :evidence_review_runner, fn workspace, issue, handoff, bundle ->
+            Evidence.review_bundle(workspace, issue, handoff, bundle)
+          end)
+
+        case review_runner.(state.workspace, state.issue, handoff, bundle) do
+          {:ok, %{verdict: "pass"} = review} ->
+            record_evidence_review(state, bundle_id, attempt, review)
+            record_evidence_bundle_status(state, bundle_id, bundle, "review_passed", "pass", Map.get(review, :summary))
+
+            _ =
+              Storage.append_event(state.run_id, "info", "evidence review passed", %{
+                issue_session_id: state.issue_session_id,
+                bundle_id: bundle_id,
+                attempt: attempt,
+                manifest_path: bundle.manifest_path,
+                summary: Map.get(review, :summary)
+              })
+
+            {:ok, state}
+
+          {:ok, review} ->
+            record_evidence_review(state, bundle_id, attempt, review)
+            record_evidence_bundle_status(state, bundle_id, bundle, "review_failed", "fail", Map.get(review, :summary))
+            handle_evidence_gate_failure(state, handoff, bundle_id, attempt, review, :evidence_review_failed)
+
+          {:error, reason} ->
+            review = %{verdict: "request_changes", summary: "Evidence review failed to complete", feedback: %{reason: inspect(reason)}}
+            record_evidence_review(state, bundle_id, attempt, review)
+            record_evidence_bundle_status(state, bundle_id, bundle, "review_failed", "fail", review.summary)
+            handle_evidence_gate_failure(state, handoff, bundle_id, attempt, review, reason)
+        end
+
+      {:error, reason} ->
+        review = %{
+          verdict: "request_changes",
+          summary: "Required evidence bundle is missing or invalid",
+          feedback: %{reason: inspect(reason), required_action: "Create a valid evidence manifest and write a fresh handoff marker."}
+        }
+
+        record_evidence_review(state, bundle_id, attempt, review)
+
+        _ =
+          Storage.upsert_evidence_bundle(%{
+            id: bundle_id,
+            run_id: state.run_id,
+            issue_session_id: state.issue_session_id,
+            issue_identifier: state.issue.identifier,
+            workspace_path: state.workspace,
+            manifest_path: Map.get(decision, :manifest_path) || Map.get(decision, :bundle_path),
+            required: true,
+            status: "missing_or_invalid",
+            reason: inspect(reason),
+            verdict: "fail",
+            summary: review.summary
+          })
+
+        handle_evidence_gate_failure(state, handoff, bundle_id, attempt, review, reason)
+    end
+  end
+
+  defp record_evidence_bundle_status(state, bundle_id, bundle, status, verdict, summary) do
+    Storage.upsert_evidence_bundle(%{
+      id: bundle_id,
+      run_id: state.run_id,
+      issue_session_id: state.issue_session_id,
+      issue_identifier: state.issue.identifier,
+      workspace_path: state.workspace,
+      manifest_path: bundle.manifest_path,
+      required: true,
+      status: status,
+      reason: "blocking evidence review",
+      verdict: verdict,
+      summary: summary
+    })
+  end
+
+  defp record_evidence_review(state, bundle_id, attempt, review) do
+    Storage.record_evidence_review(%{
+      bundle_id: bundle_id,
+      run_id: state.run_id,
+      issue_session_id: state.issue_session_id,
+      attempt: attempt,
+      agent_kind: "review-agent",
+      session_id: Map.get(review, :session_id),
+      thread_id: Map.get(review, :thread_id),
+      verdict: Map.get(review, :verdict, "request_changes"),
+      summary: Map.get(review, :summary),
+      feedback: Map.get(review, :feedback, %{}),
+      output_path: Map.get(review, :output_path)
+    })
+  end
+
+  defp handle_evidence_gate_failure(state, handoff, bundle_id, attempt, review, reason) do
+    max_attempts = Evidence.max_attempts()
+
+    _ =
+      Storage.append_event(state.run_id, "warning", "evidence review did not pass", %{
+        issue_session_id: state.issue_session_id,
+        bundle_id: bundle_id,
+        attempt: attempt,
+        max_attempts: max_attempts,
+        verdict: Map.get(review, :verdict, "request_changes"),
+        summary: Map.get(review, :summary),
+        reason: inspect(reason)
+      })
+
+    if attempt < max_attempts do
+      prompt = evidence_feedback_prompt(state.issue, handoff, review, reason, attempt, max_attempts)
+      _ = write_evidence_feedback_file(state.workspace, review, reason)
+      _ = remove_handoff_marker(state)
+      {:continue_with_prompt, state, prompt}
+    else
+      report_evidence_needs_input(state, handoff, review, reason)
+    end
+  end
+
+  defp evidence_feedback_prompt(%Issue{} = issue, handoff, review, reason, attempt, max_attempts) do
+    """
+    Evidence review feedback:
+
+    - Issue: #{issue.identifier || issue.id} — #{issue.title}
+    - PR URL, if known: #{issue.pr_url || Map.get(handoff, :pr_url) || "unknown"}
+    - Evidence review attempt: #{attempt} of #{max_attempts}
+    - Verdict: #{Map.get(review, :verdict, "request_changes")}
+    - Summary: #{Map.get(review, :summary) || inspect(reason)}
+
+    The review agent did not accept the evidence bundle for human-review handoff.
+    Continue in this same durable executor thread. Inspect `.symphony/evidence/review-feedback.md`, the evidence bundle, the PR/diff/checks, and the issue acceptance criteria. Fix the implementation or regenerate evidence as needed.
+
+    When the PR is genuinely ready again, write a fresh `.symphony/handoff.json` with `ready: true`, `state: "human-review"`, `pr_url`, and an `evidence` object pointing at the updated bundle manifest.
+    """
+  end
+
+  defp write_evidence_feedback_file(workspace, review, reason) when is_binary(workspace) do
+    feedback_path = Path.join([workspace, ".symphony", "evidence", "review-feedback.md"])
+
+    :ok = File.mkdir_p(Path.dirname(feedback_path))
+    File.write(feedback_path, Evidence.feedback_markdown(review, reason))
+  end
+
+  defp write_evidence_feedback_file(_workspace, _review, _reason), do: :ok
+
+  defp remove_handoff_marker(%{workspace: workspace}) when is_binary(workspace) do
+    case File.rm(Handoff.path(workspace)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp report_evidence_needs_input(%{issue: %Issue{id: issue_id}} = state, handoff, review, reason)
+       when is_binary(issue_id) do
+    comment_result = Tracker.create_comment(issue_id, evidence_needs_input_comment(state, handoff, review, reason))
+    state_result = Tracker.update_issue_state(issue_id, "Needs Input")
+
+    case {comment_result, state_result} do
+      {:ok, :ok} ->
+        refreshed_issue =
+          case fetch_single_issue_state(state) do
+            {:ok, issue} -> issue
+            _ -> %{state.issue | state: "Needs Input"}
+          end
+
+        {:stop, %{state | issue: refreshed_issue}, :needs_input}
+
+      {comment_error, state_error} ->
+        {:error, {:evidence_needs_input_report_failed, %{comment_result: comment_error, state_result: state_error}}}
+    end
+  end
+
+  defp report_evidence_needs_input(state, _handoff, _review, reason), do: {:error, {:evidence_review_failed, reason, state.issue}}
+
+  defp evidence_needs_input_comment(state, handoff, review, reason) do
+    """
+    ## Symphony evidence review needs input
+
+    Symphony kept this executor session autonomous through the configured evidence review attempts, but the evidence gate still did not pass.
+
+    - Issue: `#{state.issue.identifier || state.issue.id}`
+    - Run: `#{state.run_id || "unknown"}`
+    - Issue session: `#{state.issue_session_id || "unknown"}`
+    - Workspace: `#{state.workspace || "unknown"}`
+    - PR: `#{state.issue.pr_url || Map.get(handoff, :pr_url) || "unknown"}`
+    - Review verdict: `#{Map.get(review, :verdict, "request_changes")}`
+    - Summary: #{Map.get(review, :summary) || inspect(reason)}
+
+    The issue was moved to `needs-input` so an operator can inspect the workspace, PR, and evidence bundle.
+    """
+  end
+
+  defp fetch_single_issue_state(%{issue: %Issue{id: issue_id}, opts: opts}) when is_binary(issue_id) do
+    case issue_state_fetcher(opts).([issue_id]) do
+      {:ok, [%Issue{} = refreshed_issue | _]} -> {:ok, refreshed_issue}
+      {:ok, []} -> {:error, :issue_missing_after_handoff}
+      {:error, reason} -> {:error, {:issue_state_refresh_failed, reason}}
+    end
+  end
+
+  defp fetch_single_issue_state(_state), do: {:error, :issue_missing_id}
+
+  defp verify_handoff_state(%Issue{state: observed_state}, target_state) do
+    if normalize_issue_state(observed_state) == normalize_issue_state(target_state) do
+      :ok
+    else
+      {:error, {:handoff_state_mismatch, %{expected: target_state, observed: observed_state}}}
     end
   end
 
@@ -376,6 +876,8 @@ defmodule SymphonyElixir.IssueSession do
   defp build_turn_prompt(issue, opts, :resume, 1, _max_turns), do: rework_prompt(issue, opts)
 
   defp build_turn_prompt(issue, opts, :restart, 1, _max_turns), do: restart_prompt(issue, opts)
+
+  defp build_turn_prompt(_issue, _opts, {:evidence_feedback, prompt}, _turn_number, _max_turns), do: prompt
 
   defp build_turn_prompt(issue, opts, _cycle_kind, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
@@ -484,7 +986,8 @@ defmodule SymphonyElixir.IssueSession do
         :ok
 
       {comment_error, state_error} ->
-        {:error, {:human_needed_report_failed, %{reason: kind, comment_result: comment_error, state_result: state_error}}}
+        error = %{reason: kind, comment_result: comment_error, state_result: state_error}
+        {:error, {:human_needed_report_failed, error}}
     end
   end
 
@@ -571,7 +1074,7 @@ defmodule SymphonyElixir.IssueSession do
   defp send_session_state_update(_recipient, _issue, _update), do: :ok
 
   defp stop_app_session(%{app_session: %{} = app_session} = state) do
-    AppServer.stop_session(app_session)
+    CodingAgent.stop_session(:executor, app_session)
     %{state | app_session: nil}
   end
 

@@ -10,6 +10,11 @@ tracker:
     - Rework
   terminal_states:
     - Done
+github:
+  builder_token: $SYMPHONY_GITHUB_BUILDER_TOKEN
+  reviewer_token: $SYMPHONY_GITHUB_REVIEWER_TOKEN
+  review_check_name: symphony/autonomous-review
+  required_check_names: []
 polling:
   interval_ms: 10000
 workspace:
@@ -35,6 +40,14 @@ agent:
   max_artifact_nudges: 1
   max_tokens_before_first_artifact: 200000
   max_tokens_without_artifact: 300000
+evidence:
+  enabled: true
+  review_gate: blocking
+  force_labels:
+    - evidence-required
+  skip_labels:
+    - evidence-skip
+  max_review_attempts: 2
 codex:
   command: codex --config shell_environment_policy.inherit=all app-server
   approval_policy: on-request
@@ -70,7 +83,7 @@ Rules:
    - `rework` = Rework
    - `merging` = Merging
 3. Symphony owns the kickoff claim transition. If this worker starts while the issue is still Todo/`agent-ready`, stop as claim drift instead of implementing.
-4. Symphony creates a local `.symphony/workpad.md` run ledger before Codex starts. Read it early if it helps, update it when it clarifies real work, and keep `.symphony/` out of commits.
+4. Symphony creates local `.symphony/` runtime files before and during a run. Read `.symphony/workpad.md` early if it helps, write `.symphony/handoff.json` before final handoff, and keep `.symphony/` out of commits.
 5. Before broad repo exploration, verify the `before_run` hook put the checkout on the issue branch, read `docs/handoff-2026-04-27.md`, inspect the nearest runner/test entry points, and produce one useful repo artifact. Valid early artifacts are a focused failing/characterization test, fixture, runner config, code change, or dated validation note tied to a command you actually ran.
 6. Create or update one durable `## Codex Workpad` issue comment at the first natural checkpoint: once the initial plan is clear, once the first artifact exists, or when genuinely blocked. Prefer targeted issue comment/PR lookup before the first repo artifact, while using broader history when it is genuinely needed to avoid duplicating work.
 7. Treat the project goal as proving the autonomous exhaustion runner can close real target gaps with honest evidence.
@@ -83,5 +96,5 @@ Rules:
 14. Run the most relevant targeted validation for the change. Use `npm run typecheck` and `npm test` when the scope touches shared behavior.
 15. Do not claim completion without concrete evidence from commands, tests, or a real runner walk.
 16. Create or update a PR for completed work. Add a concise issue comment with changed files, validation results, blockers, and remaining uncertainty.
-17. When ready for review, remove `in-progress`/`rework` and add `human-review`. Do not close the issue yourself unless the change has landed.
-18. If you need human input, missing auth, missing secrets, or a permission you cannot resolve autonomously, leave a clear issue comment and let Symphony move the issue to `needs-input`.
+17. When ready for review, write `.symphony/handoff.json` with `ready: true`, `state: "human-review"`, `reason`, `pr_url`, summary, validation evidence, and an `evidence` object. Use `"evidence": {"required": true, "bundle_path": ".symphony/evidence/RUN-ID/manifest.json", "reason": "runner behavior changed"}` when a trace/log/validation bundle should be reviewed, or `"required": false` for docs-only/no-runtime work. Required evidence manifests use `schema_version: "symphony.evidence.v1"`, a non-empty `summary`, and at least one inspectable `artifacts` or `commands` entry. Relative artifact/log paths resolve from the manifest directory, must exist, and must stay inside the issue workspace; `http://` and `https://` URLs are allowed for externally hosted artifacts. Then stop. Symphony preserves a ready marker across restart/recovery, runs any configured evidence review, removes `in-progress`/`rework`, adds `human-review`, verifies the label state, and clears the verified marker so later rework must write a fresh one. After the ready handoff marker exists, do not start optional rediscovery or cleanup. Do not close the issue yourself unless the change has landed.
+18. If you need human input, missing auth, missing secrets, or a permission you cannot resolve autonomously, leave a clear issue comment, write `.symphony/handoff.json` with `ready: true`, `state: "needs-input"`, and the exact blocker, then let Symphony verify/move the issue to `needs-input`.

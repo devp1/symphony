@@ -15,10 +15,11 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 1. Polls GitHub Issues for candidate work across configured repositories
 2. Creates a workspace per issue
-3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
-   workspace
-4. Sends a workflow prompt to Codex
-5. Keeps Codex working on the issue until it produces a PR-ready handoff or reaches a real blocker
+3. Launches the configured coding-agent adapter inside the workspace. The current default adapter is
+   Codex in [App Server mode](https://developers.openai.com/codex/app-server/).
+4. Sends a workflow prompt to the coding agent
+5. Keeps the agent working on the issue until it produces a PR-ready handoff or reaches a real
+   blocker
 
 The local Phoenix cockpit shows configured repos, GitHub issue label states, active Codex sessions,
 SQLite-backed run history, token usage, and evidence/PR handoff metadata.
@@ -26,6 +27,16 @@ SQLite-backed run history, token usage, and evidence/PR handoff metadata.
 For `runtime_profile: local_trusted` GitHub runs, Symphony keeps one durable Codex issue session
 alive across implementation, PR handoff parking at `human-review`, and later `rework`. Runs remain
 per-active-cycle audit records; the issue session is the durable collaborator identity.
+Workers also write a local `.symphony/handoff.json` marker before final handoff. Symphony treats
+that file as a controller-actionable signal, applies the requested GitHub label transition itself,
+and verifies the refreshed issue state before parking or stopping the session. In local trusted
+runs, Symphony watches for a ready marker during an active turn and interrupts that turn through
+Codex app-server `turn/interrupt` so the durable thread parks cleanly after handoff instead of
+drifting into more work.
+If the handoff requests `human-review` with required evidence, Symphony runs a separate review-agent
+turn through the same coding-agent adapter boundary before applying the label. Missing or failed
+evidence is fed back into the same executor thread; after the configured attempt budget, the issue
+moves to `needs-input` for operator inspection.
 
 If a claimed issue moves to a terminal state (`Done`), Symphony stops the active agent for that
 issue and cleans up matching workspaces.
@@ -66,8 +77,10 @@ mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
 After changing Elixir source, run `mise exec -- mix build` again before dogfooding
-`./bin/symphony`. The checked-in escript is static; running a stale binary can make
-the cockpit look like it ignored source fixes.
+`./bin/symphony`. The checked-in escript is static, and the CLI refuses to start
+from a source checkout when runtime source files are newer than `bin/symphony`.
+Use `--allow-stale-binary` only for deliberate debugging of an older packaged
+binary.
 
 ## Configuration
 
@@ -81,6 +94,8 @@ If no path is passed, Symphony defaults to `./WORKFLOW.md`.
 
 Optional flags:
 
+- `--allow-stale-binary` bypasses the source-vs-escript freshness guard. This
+  should be rare; normal local dogfood should rebuild with `mise exec -- mix build`.
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
 
@@ -95,6 +110,11 @@ tracker:
   kind: github
   owner: devp1
   repo: Beacon
+github:
+  builder_token: $SYMPHONY_GITHUB_BUILDER_TOKEN
+  reviewer_token: $SYMPHONY_GITHUB_REVIEWER_TOKEN
+  review_check_name: symphony/autonomous-review
+  required_check_names: []
 repos:
   - id: beacon
     owner: devp1
@@ -118,6 +138,12 @@ agent:
   max_artifact_nudges: 2
   max_tokens_before_first_artifact: 300000
   max_tokens_without_artifact: 750000
+evidence:
+  enabled: true
+  review_gate: blocking
+  force_labels: [evidence-required]
+  skip_labels: [evidence-skip]
+  max_review_attempts: 2
 codex:
   command: codex --config shell_environment_policy.inherit=all app-server
   approval_policy: never
@@ -134,6 +160,17 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- `github.builder_token` and `github.reviewer_token` are optional `$VAR` token references for
+  separate GitHub App identities. The builder identity owns issue labels/comments, branches, PR
+  creation, and normal worker handoff. The reviewer identity owns autonomous PR review checks and
+  PR review comments/approvals. Tokens stay in Symphony config/runtime env; executor/reviewer
+  agents do not receive private keys.
+- `github.review_check_name` defaults to `symphony/autonomous-review`. Symphony records autonomous
+  reviewer verdicts in SQLite and can publish a GitHub check with conclusion `success`,
+  `failure`, or `action_required` for `pass`, `request_changes`, or `needs_input`.
+- Symphony refuses pass-style PR approvals unless the configured reviewer token is present and
+  distinct from the builder token. For Symphony-authored PRs, failed autonomous review routes back
+  to the executor/rework path instead of letting the reviewer push fixes to the builder branch.
 - `runtime_profile` defaults to `default`. Set `runtime_profile: local_trusted` only for trusted
   local dogfood runs that need Codex workers to push branches, open PRs, and comment on GitHub; it
   runs local Codex sessions with `danger-full-access` so Git handoff is not blocked by sandboxed
@@ -151,6 +188,26 @@ Notes:
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   active work cycle when a turn completes normally but the issue is still in an active state.
   Default: `20`. Local trusted sessions park at that boundary and can resume the same thread.
+- `.symphony/handoff.json` is the machine-readable worker handoff marker. It is runtime state and
+  must not be committed. The supported final states are `human-review`, `needs-input`, `blocked`,
+  and `done`; Symphony maps those to the configured tracker labels/state and verifies the result.
+  Stale handoff markers are cleared at the start of each active local work cycle, so rework must
+  write a fresh marker when it becomes review-ready again.
+- For `human-review`, workers may include an `evidence` object in the handoff marker:
+  `{"required": true, "bundle_path": ".symphony/evidence/<run>/manifest.json", "reason": "UI changed"}`.
+  In the default blocking gate, Symphony records the bundle, runs a review-agent turn through the
+  coding-agent adapter with full repo read/network access and write access only to its review
+  artifact, and only then applies `human-review`. Failed or missing evidence creates
+  `.symphony/evidence/review-feedback.md`, removes the stale handoff marker, and prompts the same
+  executor thread to fix the work or evidence.
+- Required evidence manifests use `schema_version: "symphony.evidence.v1"`, a non-empty `summary`,
+  and at least one inspectable `artifacts` or `commands` entry. Local artifact/log paths resolve
+  from the manifest directory, must exist, and must stay inside the issue workspace. `http://` and
+  `https://` URLs are allowed for externally hosted artifacts. Artifact `kind` values are flexible
+  so agents can add new proof types without controller changes.
+- `evidence.enabled`, `evidence.review_gate`, `evidence.force_labels`, `evidence.skip_labels`, and
+  `evidence.max_review_attempts` configure that gate. `review_gate: advisory` records evidence
+  metadata without blocking handoff; `review_gate: off` disables it.
 - `agent.artifact_nudge_tokens`, `agent.max_tokens_before_first_artifact`, and
   `agent.max_tokens_without_artifact` are advisory health budgets for local trusted durable
   sessions. When crossed, Symphony records `stale-proof` or `high-token-no-proof` warnings in the

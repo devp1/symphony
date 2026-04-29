@@ -71,6 +71,54 @@ defmodule SymphonyElixir.Storage do
           optional(:stop_reason) => String.t() | nil
         }
 
+  @type evidence_bundle_attrs :: %{
+          optional(:id) => String.t(),
+          optional(:run_id) => String.t(),
+          optional(:issue_session_id) => String.t() | nil,
+          optional(:issue_identifier) => String.t() | nil,
+          optional(:workspace_path) => String.t() | nil,
+          optional(:manifest_path) => String.t() | nil,
+          optional(:required) => boolean(),
+          optional(:status) => String.t(),
+          optional(:reason) => String.t() | nil,
+          optional(:verdict) => String.t() | nil,
+          optional(:summary) => String.t() | nil
+        }
+
+  @type evidence_review_attrs :: %{
+          optional(:id) => String.t(),
+          optional(:bundle_id) => String.t(),
+          optional(:run_id) => String.t(),
+          optional(:issue_session_id) => String.t() | nil,
+          optional(:attempt) => integer(),
+          optional(:agent_kind) => String.t(),
+          optional(:session_id) => String.t() | nil,
+          optional(:thread_id) => String.t() | nil,
+          optional(:verdict) => String.t(),
+          optional(:summary) => String.t() | nil,
+          optional(:feedback) => term(),
+          optional(:output_path) => String.t() | nil
+        }
+
+  @type autonomous_review_attrs :: %{
+          optional(:id) => String.t(),
+          optional(:run_id) => String.t() | nil,
+          optional(:issue_session_id) => String.t() | nil,
+          optional(:repo_id) => String.t() | nil,
+          optional(:issue_number) => integer() | nil,
+          optional(:issue_identifier) => String.t() | nil,
+          optional(:pr_url) => String.t() | nil,
+          optional(:head_sha) => String.t() | nil,
+          optional(:reviewer_kind) => String.t(),
+          optional(:verdict) => String.t(),
+          optional(:summary) => String.t() | nil,
+          optional(:findings) => term(),
+          optional(:check_name) => String.t() | nil,
+          optional(:check_conclusion) => String.t() | nil,
+          optional(:stale) => boolean(),
+          optional(:output_path) => String.t() | nil
+        }
+
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     name = Keyword.get(opts, :name, __MODULE__)
@@ -130,6 +178,55 @@ defmodule SymphonyElixir.Storage do
   @spec put_artifact(String.t(), map()) :: :ok | {:error, term()}
   def put_artifact(run_id, attrs), do: call_or_direct({:put_artifact, run_id, attrs})
 
+  @spec upsert_evidence_bundle(evidence_bundle_attrs()) :: {:ok, String.t()} | {:error, term()}
+  def upsert_evidence_bundle(attrs), do: call_or_direct({:upsert_evidence_bundle, attrs})
+
+  @spec record_evidence_review(evidence_review_attrs()) :: {:ok, String.t()} | {:error, term()}
+  def record_evidence_review(attrs), do: call_or_direct({:record_evidence_review, attrs})
+
+  @spec record_autonomous_review(autonomous_review_attrs()) :: {:ok, String.t()} | {:error, term()}
+  def record_autonomous_review(attrs), do: call_or_direct({:record_autonomous_review, attrs})
+
+  @spec list_evidence_bundles(non_neg_integer()) :: [map()]
+  def list_evidence_bundles(limit \\ 50) when is_integer(limit) and limit >= 0 do
+    query_json("""
+    select *
+    from evidence_bundles
+    order by updated_at desc
+    limit #{limit}
+    """)
+  end
+
+  @spec list_evidence_reviews(non_neg_integer()) :: [map()]
+  def list_evidence_reviews(limit \\ 100) when is_integer(limit) and limit >= 0 do
+    query_json("""
+    select *
+    from evidence_reviews
+    order by created_at desc
+    limit #{limit}
+    """)
+  end
+
+  @spec evidence_reviews_for_run(String.t()) :: [map()]
+  def evidence_reviews_for_run(run_id) when is_binary(run_id) do
+    query_json("""
+    select *
+    from evidence_reviews
+    where run_id = #{sql_quote(run_id)}
+    order by attempt, created_at, id
+    """)
+  end
+
+  @spec list_autonomous_reviews(non_neg_integer()) :: [map()]
+  def list_autonomous_reviews(limit \\ 100) when is_integer(limit) and limit >= 0 do
+    query_json("""
+    select *
+    from autonomous_reviews
+    order by created_at desc
+    limit #{limit}
+    """)
+  end
+
   @spec list_repos() :: [map()]
   def list_repos, do: query_json("select * from repos order by id")
 
@@ -168,6 +265,9 @@ defmodule SymphonyElixir.Storage do
         run
         |> Map.put("events", run_events(run_id))
         |> Map.put("artifacts", run_artifacts(run_id))
+        |> Map.put("evidence_bundles", run_evidence_bundles(run_id))
+        |> Map.put("evidence_reviews", run_evidence_reviews(run_id))
+        |> Map.put("autonomous_reviews", run_autonomous_reviews(run_id))
 
       _ ->
         nil
@@ -246,6 +346,24 @@ defmodule SymphonyElixir.Storage do
     {:reply, do_put_artifact(path, run_id, attrs), state}
   end
 
+  def handle_call({:upsert_evidence_bundle, attrs}, _from, state) do
+    path = sqlite_path()
+    _ = migrate(path)
+    {:reply, do_upsert_evidence_bundle(path, attrs), state}
+  end
+
+  def handle_call({:record_evidence_review, attrs}, _from, state) do
+    path = sqlite_path()
+    _ = migrate(path)
+    {:reply, do_record_evidence_review(path, attrs), state}
+  end
+
+  def handle_call({:record_autonomous_review, attrs}, _from, state) do
+    path = sqlite_path()
+    _ = migrate(path)
+    {:reply, do_record_autonomous_review(path, attrs), state}
+  end
+
   defp call_or_direct(message) do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) -> GenServer.call(pid, message)
@@ -274,6 +392,9 @@ defmodule SymphonyElixir.Storage do
 
   defp direct(path, {:append_event, run_id, level, message, data}), do: do_append_event(path, run_id, level, message, data)
   defp direct(path, {:put_artifact, run_id, attrs}), do: do_put_artifact(path, run_id, attrs)
+  defp direct(path, {:upsert_evidence_bundle, attrs}), do: do_upsert_evidence_bundle(path, attrs)
+  defp direct(path, {:record_evidence_review, attrs}), do: do_record_evidence_review(path, attrs)
+  defp direct(path, {:record_autonomous_review, attrs}), do: do_record_autonomous_review(path, attrs)
 
   defp migrate(path) do
     sql = """
@@ -358,6 +479,55 @@ defmodule SymphonyElixir.Storage do
       label text,
       content_type text,
       bytes integer,
+      created_at text not null
+    );
+    create table if not exists evidence_bundles (
+      id text primary key,
+      run_id text not null,
+      issue_session_id text,
+      issue_identifier text,
+      workspace_path text,
+      manifest_path text,
+      required integer not null,
+      status text not null,
+      reason text,
+      verdict text,
+      summary text,
+      created_at text not null,
+      updated_at text not null
+    );
+    create table if not exists evidence_reviews (
+      id text primary key,
+      bundle_id text not null,
+      run_id text not null,
+      issue_session_id text,
+      attempt integer not null,
+      agent_kind text not null,
+      session_id text,
+      thread_id text,
+      verdict text not null,
+      summary text,
+      feedback_json text,
+      output_path text,
+      created_at text not null
+    );
+    create table if not exists autonomous_reviews (
+      id text primary key,
+      run_id text,
+      issue_session_id text,
+      repo_id text,
+      issue_number integer,
+      issue_identifier text,
+      pr_url text,
+      head_sha text,
+      reviewer_kind text not null,
+      verdict text not null,
+      summary text,
+      findings_json text,
+      check_name text,
+      check_conclusion text,
+      stale integer not null,
+      output_path text,
       created_at text not null
     );
     """
@@ -537,7 +707,7 @@ defmodule SymphonyElixir.Storage do
   defp do_interrupt_running_issue_sessions(path, reason) when is_binary(reason) do
     session_ids =
       path
-      |> query_json_at_path("select id from issue_sessions where state in ('starting', 'running', 'parked') order by created_at;")
+      |> query_json_at_path("select id from issue_sessions where state in ('starting', 'running') order by created_at;")
       |> Enum.flat_map(fn
         %{"id" => id} when is_binary(id) -> [id]
         _ -> []
@@ -552,7 +722,7 @@ defmodule SymphonyElixir.Storage do
 
         case exec(
                path,
-               "update issue_sessions set state = 'interrupted-resumable', stop_reason = #{sql_quote(reason)}, health_json = #{json(["interrupted-resumable"])}, updated_at = #{sql_quote(now)} where state in ('starting', 'running', 'parked');"
+               "update issue_sessions set state = 'interrupted-resumable', stop_reason = #{sql_quote(reason)}, health_json = #{json(["interrupted-resumable"])}, app_server_pid = null, updated_at = #{sql_quote(now)} where state in ('starting', 'running');"
              ) do
           :ok -> {:ok, length(session_ids)}
           {:error, reason} -> {:error, reason}
@@ -576,6 +746,54 @@ defmodule SymphonyElixir.Storage do
     """)
   end
 
+  defp do_upsert_evidence_bundle(path, attrs) do
+    now = timestamp()
+    id = attrs[:id] || "evidence-bundle-" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+    case exec(path, """
+         insert into evidence_bundles(id, run_id, issue_session_id, issue_identifier, workspace_path, manifest_path, required, status, reason, verdict, summary, created_at, updated_at)
+         values (#{sql_quote(id)}, #{sql_quote(required(attrs, :run_id))}, #{sql_quote(attrs[:issue_session_id])}, #{sql_quote(attrs[:issue_identifier])}, #{sql_quote(attrs[:workspace_path])}, #{sql_quote(attrs[:manifest_path])}, #{boolean_integer(attrs[:required])}, #{sql_quote(attrs[:status] || "pending")}, #{sql_quote(attrs[:reason])}, #{sql_quote(attrs[:verdict])}, #{sql_quote(attrs[:summary])}, #{sql_quote(now)}, #{sql_quote(now)})
+         on conflict(id) do update set
+           issue_session_id = excluded.issue_session_id,
+           issue_identifier = excluded.issue_identifier,
+           workspace_path = excluded.workspace_path,
+           manifest_path = excluded.manifest_path,
+           required = excluded.required,
+           status = excluded.status,
+           reason = excluded.reason,
+           verdict = excluded.verdict,
+           summary = excluded.summary,
+           updated_at = excluded.updated_at;
+         """) do
+      :ok -> {:ok, id}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp do_record_evidence_review(path, attrs) do
+    id = attrs[:id] || "evidence-review-" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+    case exec(path, """
+         insert into evidence_reviews(id, bundle_id, run_id, issue_session_id, attempt, agent_kind, session_id, thread_id, verdict, summary, feedback_json, output_path, created_at)
+         values (#{sql_quote(id)}, #{sql_quote(required(attrs, :bundle_id))}, #{sql_quote(required(attrs, :run_id))}, #{sql_quote(attrs[:issue_session_id])}, #{integer(attrs[:attempt] || 1)}, #{sql_quote(attrs[:agent_kind] || "review-agent")}, #{sql_quote(attrs[:session_id])}, #{sql_quote(attrs[:thread_id])}, #{sql_quote(attrs[:verdict] || "fail")}, #{sql_quote(attrs[:summary])}, #{json(attrs[:feedback] || %{})}, #{sql_quote(attrs[:output_path])}, #{sql_quote(timestamp())});
+         """) do
+      :ok -> {:ok, id}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp do_record_autonomous_review(path, attrs) do
+    id = attrs[:id] || "autonomous-review-" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+    case exec(path, """
+         insert into autonomous_reviews(id, run_id, issue_session_id, repo_id, issue_number, issue_identifier, pr_url, head_sha, reviewer_kind, verdict, summary, findings_json, check_name, check_conclusion, stale, output_path, created_at)
+         values (#{sql_quote(id)}, #{sql_quote(attrs[:run_id])}, #{sql_quote(attrs[:issue_session_id])}, #{sql_quote(attrs[:repo_id])}, #{integer(attrs[:issue_number])}, #{sql_quote(attrs[:issue_identifier])}, #{sql_quote(attrs[:pr_url])}, #{sql_quote(attrs[:head_sha])}, #{sql_quote(attrs[:reviewer_kind] || "review-agent")}, #{sql_quote(attrs[:verdict] || "needs_input")}, #{sql_quote(attrs[:summary])}, #{json(attrs[:findings] || [])}, #{sql_quote(attrs[:check_name])}, #{sql_quote(attrs[:check_conclusion])}, #{boolean_integer(attrs[:stale])}, #{sql_quote(attrs[:output_path])}, #{sql_quote(timestamp())});
+         """) do
+      :ok -> {:ok, id}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp run_events(run_id) do
     query_json("""
     select *
@@ -589,6 +807,33 @@ defmodule SymphonyElixir.Storage do
     query_json("""
     select *
     from artifacts
+    where run_id = #{sql_quote(run_id)}
+    order by created_at, id
+    """)
+  end
+
+  defp run_evidence_bundles(run_id) do
+    query_json("""
+    select *
+    from evidence_bundles
+    where run_id = #{sql_quote(run_id)}
+    order by updated_at, id
+    """)
+  end
+
+  defp run_evidence_reviews(run_id) do
+    query_json("""
+    select *
+    from evidence_reviews
+    where run_id = #{sql_quote(run_id)}
+    order by attempt, created_at, id
+    """)
+  end
+
+  defp run_autonomous_reviews(run_id) do
+    query_json("""
+    select *
+    from autonomous_reviews
     where run_id = #{sql_quote(run_id)}
     order by created_at, id
     """)
@@ -678,6 +923,10 @@ defmodule SymphonyElixir.Storage do
   defp integer(nil), do: "null"
   defp integer(value) when is_integer(value), do: Integer.to_string(value)
   defp integer(value), do: value |> to_string() |> String.to_integer() |> Integer.to_string()
+
+  defp boolean_integer(true), do: "1"
+  defp boolean_integer(false), do: "0"
+  defp boolean_integer(_value), do: "0"
 
   defp timestamp do
     DateTime.utc_now()

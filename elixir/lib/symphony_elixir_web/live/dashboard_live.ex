@@ -167,6 +167,47 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <section class="section-card">
           <div class="section-header">
             <div>
+              <h2 class="section-title">Autonomous review</h2>
+              <p class="section-copy">Independent PR review verdicts and GitHub check conclusions.</p>
+            </div>
+          </div>
+
+          <%= if @payload.autonomous_reviews == [] do %>
+            <p class="empty-state">No autonomous PR reviews recorded yet.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>Verdict</th>
+                    <th>Check</th>
+                    <th>Head</th>
+                    <th>Summary</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={review <- @payload.autonomous_reviews}>
+                    <td>
+                      <div class="issue-stack">
+                        <span class="issue-id"><%= review["issue_identifier"] || "n/a" %></span>
+                        <a :if={review["pr_url"]} class="issue-link" href={review["pr_url"]} target="_blank" rel="noopener noreferrer">PR</a>
+                      </div>
+                    </td>
+                    <td><span class={state_badge_class(review["verdict"])}><%= review["verdict"] %></span></td>
+                    <td><%= review["check_name"] || "n/a" %> / <%= review["check_conclusion"] || "n/a" %></td>
+                    <td class="mono"><%= review["head_sha"] || "n/a" %></td>
+                    <td><%= review["summary"] || "n/a" %></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
               <h2 class="section-title">Parked sessions</h2>
               <p class="section-copy">Durable Codex sessions that are paused at review and ready to resume on rework.</p>
             </div>
@@ -402,6 +443,47 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <% end %>
                       </div>
                     </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Evidence gate</h2>
+              <p class="section-copy">Executor evidence bundles and review-agent verdicts before human-review handoff.</p>
+            </div>
+          </div>
+
+          <%= if @payload.evidence_bundles == [] do %>
+            <p class="empty-state">No evidence bundles recorded yet.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>Status</th>
+                    <th>Verdict</th>
+                    <th>Manifest</th>
+                    <th>Summary</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={bundle <- @payload.evidence_bundles}>
+                    <td>
+                      <div class="issue-stack">
+                        <span class="issue-id"><%= bundle["issue_identifier"] || "n/a" %></span>
+                        <a :if={bundle["run_id"]} class="issue-link" href={"/api/v1/runs/#{bundle["run_id"]}"}>Run details</a>
+                      </div>
+                    </td>
+                    <td><span class={state_badge_class(bundle["status"])}><%= bundle["status"] %></span></td>
+                    <td><%= bundle["verdict"] || "n/a" %></td>
+                    <td class="mono"><%= bundle["manifest_path"] || "n/a" %></td>
+                    <td><%= bundle["summary"] || bundle["reason"] || "n/a" %></td>
                   </tr>
                 </tbody>
               </table>

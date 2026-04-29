@@ -11,6 +11,11 @@ tracker:
     - Rework
   terminal_states:
     - Done
+github:
+  builder_token: $SYMPHONY_GITHUB_BUILDER_TOKEN
+  reviewer_token: $SYMPHONY_GITHUB_REVIEWER_TOKEN
+  review_check_name: symphony/autonomous-review
+  required_check_names: []
 repos:
   - id: beacon
     owner: devp1
@@ -55,6 +60,14 @@ agent:
   max_artifact_nudges: 1
   max_tokens_before_first_artifact: 200000
   max_tokens_without_artifact: 300000
+evidence:
+  enabled: true
+  review_gate: blocking
+  force_labels:
+    - evidence-required
+  skip_labels:
+    - evidence-skip
+  max_review_attempts: 2
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
@@ -104,7 +117,7 @@ Soft budget: if the first implementation path is uncertain after a serious targe
 For routine GitHub mutations in this unattended run, use the authenticated `gh` CLI from the shell (`gh issue view/comment/edit`, `gh pr create/view`, `git push`). Do not use GitHub MCP/app connector tools for ordinary comments, labels, or PR handoff; those connector tools can request interactive approval and stall an unattended worker.
 Prefer targeted comment/PR lookup before the first repo artifact; full issue history is fine after a repo artifact exists, or earlier only when it truly changes the implementation path.
 
-PR handoff fast path: once the branch is pushed, the PR is open/updated, the PR links the issue, required validation is recorded, and one bounded feedback/check sweep finds no actionable comments or failing checks, immediately move the issue from `in-progress`/`rework` to `human-review` and stop. Do not reread broad issue history, repo history, old run logs, memory rollups, or extra docs after the PR is already review-ready unless the bounded sweep surfaces a concrete blocker.
+PR handoff fast path: once the branch is pushed, the PR is open/updated, the PR links the issue, required validation is recorded, and one bounded feedback/check sweep finds no actionable comments or failing checks, write `.symphony/handoff.json` with `ready: true`, `state: "human-review"`, `reason`, `pr_url`, and an `evidence` object when evidence is required or intentionally skipped. Then stop. Symphony may interrupt the active turn when it sees the marker, run the evidence gate when configured, and apply/verify the final label transition itself. Do not move the issue to `human-review` manually after writing the marker, and do not start a new investigation or optional cleanup pass. Do not reread broad issue history, repo history, old run logs, memory rollups, or extra docs after the PR is already review-ready unless the bounded sweep surfaces a concrete blocker.
 
 Description:
 {% if issue.description %}
@@ -117,8 +130,8 @@ Instructions:
 
 1. This is an unattended GitHub issue-to-PR run. Never ask a human to perform follow-up actions unless a required secret, credential, or permission is genuinely missing.
 2. Keep Codex powerful: inspect deeply, implement decisively, and leave durable evidence through code, tests, docs, artifacts, commits, comments, and PRs.
-3. Symphony owns the initial claim transition before worker launch. A successful run produces a PR ready for review, comments concise evidence on the issue, and moves the issue from `in-progress` to `human-review`. In local trusted mode, Symphony parks this same Codex issue session at `human-review` so later `rework` can continue in the same thread.
-4. If blocked, comment the exact blocker and move the issue to `needs-input`; do not retry blindly.
+3. Symphony owns the initial claim transition before worker launch and the final label transition after a verified handoff marker. A successful run produces a PR ready for review, comments concise evidence on the issue, writes `.symphony/handoff.json` with `state: "human-review"`, and lets Symphony run any configured evidence review before moving the issue from `in-progress` to `human-review`. In local trusted mode, Symphony preserves a ready handoff marker across restart/recovery, verifies it before launching another turn, clears it after the tracker transition is verified, and parks this same Codex issue session at `human-review` so later `rework` can continue in the same thread. Rework must write a fresh marker after addressing feedback.
+4. If blocked, comment the exact blocker, write `.symphony/handoff.json` with `ready: true`, `state: "needs-input"`, and a concise `reason`, then move the issue to `needs-input`; do not retry blindly.
 5. Final message must report completed actions and blockers only. Do not include "next steps for user".
 
 Work only in the provided repository copy. Do not touch any other path.
@@ -135,6 +148,52 @@ Work only in the provided repository copy. Do not touch any other path.
   - `rework` -> reviewer requested changes
   - `merging` -> approved and ready for merge workflow
 - Symphony creates a local `.symphony/workpad.md` run ledger before Codex starts. Read it early if it helps, update it when it clarifies real work, and keep `.symphony/` out of commits.
+- Before final handoff, write `.symphony/handoff.json` as Symphony's machine-readable final-state marker. Keep it out of commits. Use this shape:
+  ```json
+  {
+    "ready": true,
+    "state": "human-review",
+    "reason": "pr-ready",
+    "pr_url": "https://github.com/OWNER/REPO/pull/123",
+    "summary": "One concise sentence",
+    "validation": ["npm test"],
+    "evidence": {
+      "required": true,
+      "bundle_path": ".symphony/evidence/RUN-ID/manifest.json",
+      "reason": "UI or runtime behavior changed"
+    }
+  }
+  ```
+  If evidence is not needed, set `"evidence": {"required": false, "reason": "docs-only"}` so Symphony records the executor decision.
+  When evidence is required, create the referenced manifest before writing the handoff marker. Use this v1 shape:
+  ```json
+  {
+    "schema_version": "symphony.evidence.v1",
+    "summary": "What changed and what this bundle proves.",
+    "artifacts": [
+      {
+        "kind": "playwright-trace",
+        "path": "trace.zip",
+        "label": "Primary UI trace"
+      }
+    ],
+    "commands": [
+      {
+        "command": "npm test",
+        "status": "passed",
+        "exit_code": 0,
+        "output_path": "npm-test.log"
+      }
+    ],
+    "changed_files": ["src/example.ts"]
+  }
+  ```
+  Relative artifact and command output paths resolve from the manifest directory. Local paths must
+  exist and stay inside the issue workspace; `http://` or `https://` URLs are allowed for externally
+  hosted artifacts. The manifest must include a non-empty `summary` and at least one `artifacts` or
+  `commands` entry. Artifact `kind` values are intentionally flexible so agents can introduce new
+  proof types without waiting for Symphony changes.
+  Use `"state": "needs-input"` or `"blocked"` only for a verified blocker, and include the exact blocker in `reason` or `summary`.
 - Use one `## Codex Workpad` issue comment for durable coordination, but do not let comment reconciliation delay the first real repo artifact.
 - Spend effort up front on planning and verification design, then turn that plan into code/tests/fixtures quickly.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
@@ -284,7 +343,8 @@ Use this only when completion is blocked by missing required tools or missing au
     - If there are no PR comments, no review summaries, no inline review comments, and no check runs, treat that as a clean sweep; do not keep polling or expanding context.
     - Repeat this check-address-verify loop only when the sweep finds actionable comments, failing checks, or required validation gaps.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
-12. Only then remove `in-progress`/`rework` and add `human-review`.
+12. Write `.symphony/handoff.json` with `ready: true`, `state: "human-review"`, PR metadata, validation, and evidence metadata.
+13. Stop after the marker. Symphony verifies the marker, runs evidence review when configured, then removes `in-progress`/`rework` and adds `human-review`.
     - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
 13. For `Todo` issues that already had a PR attached at kickoff:
     - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).

@@ -5,6 +5,8 @@ defmodule SymphonyElixir.GitHub.Client do
 
   alias SymphonyElixir.{Config, Linear.Issue, Storage}
 
+  @type github_role :: Config.github_role()
+
   @spec preflight() :: :ok | {:error, term()}
   def preflight do
     with :ok <- gh_auth_preflight() do
@@ -111,6 +113,78 @@ defmodule SymphonyElixir.GitHub.Client do
         with :ok <- open_issue(repo_config, issue_number), do: replace_state_label(repo_config, issue_number, state_name)
     end
   end
+
+  @spec upsert_autonomous_review_check(Issue.t(), map()) :: :ok | {:error, term()}
+  def upsert_autonomous_review_check(%Issue{} = issue, attrs) when is_map(attrs) do
+    repo_config = repo_config_for_issue(issue)
+    github_config = Config.settings!().github
+    verdict = normalize_review_verdict(Map.get(attrs, :verdict) || Map.get(attrs, "verdict"))
+    conclusion = review_check_conclusion(verdict)
+    summary = review_summary(attrs, verdict)
+    details = review_details(attrs, summary)
+
+    with {:ok, head_sha} <- review_head_sha(issue, attrs),
+         {:ok, _response} <-
+           gh_api(
+             repo_config,
+             [
+               "repos/#{repo_config.owner}/#{repo_config.name}/check-runs",
+               "-X",
+               "POST",
+               "-H",
+               "Accept: application/vnd.github+json",
+               "-f",
+               "name=#{github_config.review_check_name}",
+               "-f",
+               "head_sha=#{head_sha}",
+               "-f",
+               "status=completed",
+               "-f",
+               "conclusion=#{conclusion}",
+               "-f",
+               "output[title]=Symphony autonomous review: #{verdict}",
+               "-f",
+               "output[summary]=#{summary}",
+               "-f",
+               "output[text]=#{details}"
+             ],
+             :reviewer
+           ) do
+      :ok
+    end
+  end
+
+  @spec submit_autonomous_pr_review(Issue.t(), map()) :: :ok | {:error, term()}
+  def submit_autonomous_pr_review(%Issue{} = issue, attrs) when is_map(attrs) do
+    repo_config = repo_config_for_issue(issue)
+    verdict = normalize_review_verdict(Map.get(attrs, :verdict) || Map.get(attrs, "verdict"))
+
+    with {:ok, event} <- pull_request_review_event(verdict),
+         :ok <- ensure_review_approval_allowed(event),
+         {:ok, pr_number} <- pull_request_number(issue),
+         {:ok, _response} <-
+           gh_api(
+             repo_config,
+             [
+               "repos/#{repo_config.owner}/#{repo_config.name}/pulls/#{pr_number}/reviews",
+               "-X",
+               "POST",
+               "-H",
+               "Accept: application/vnd.github+json",
+               "-f",
+               "event=#{event}",
+               "-f",
+               "body=#{review_details(attrs, review_summary(attrs, verdict))}"
+             ],
+             :reviewer
+           ) do
+      :ok
+    end
+  end
+
+  @doc false
+  @spec command_env_for_test(github_role()) :: [{String.t(), String.t()}]
+  def command_env_for_test(role), do: command_env(role)
 
   @doc false
   @spec normalize_issue_for_test(map()) :: Issue.t() | nil
@@ -470,7 +544,7 @@ defmodule SymphonyElixir.GitHub.Client do
   defp parse_datetime(_value), do: nil
 
   defp gh_auth_preflight do
-    case command_fun().(["auth", "status", "-h", "github.com"]) do
+    case run_command(["auth", "status", "-h", "github.com"], :builder) do
       {_output, 0} -> :ok
       {output, status} -> {:error, {:github_auth_preflight_failed, status, String.trim(output)}}
     end
@@ -507,12 +581,12 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp gh_api(repo_config, args) when is_list(args) do
-    gh_json(repo_config, ["api" | args])
+  defp gh_api(repo_config, args, role \\ :builder) when is_list(args) do
+    gh_json(repo_config, ["api" | args], role)
   end
 
-  defp gh_json(_repo_config, args) when is_list(args) do
-    case command_fun().(args) do
+  defp gh_json(_repo_config, args, role \\ :builder) when is_list(args) do
+    case run_command(args, role) do
       {output, 0} -> Jason.decode(output)
       {output, status} -> {:error, {:gh_api_failed, status, String.trim(output)}}
     end
@@ -523,14 +597,112 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp command_fun do
-    Application.get_env(:symphony_elixir, :github_command_fun, fn args ->
-      System.cmd("gh", args, stderr_to_stdout: true)
+    Application.get_env(:symphony_elixir, :github_command_fun, fn args, env ->
+      System.cmd("gh", args, stderr_to_stdout: true, env: env)
     end)
+  end
+
+  defp run_command(args, role) do
+    command = command_fun()
+    env = command_env(role)
+
+    cond do
+      is_function(command, 2) ->
+        command.(args, env)
+
+      is_function(command, 1) ->
+        command.(args)
+
+      true ->
+        System.cmd("gh", args, stderr_to_stdout: true, env: env)
+    end
+  end
+
+  defp command_env(role) when role in [:builder, :reviewer] do
+    case Config.github_token(role) do
+      token when is_binary(token) and token != "" -> [{"GH_TOKEN", token}, {"GITHUB_TOKEN", token}]
+      _ -> []
+    end
   end
 
   defp primary_repo! do
     Config.primary_repo() || %{id: "github", owner: Config.settings!().tracker.owner, name: Config.settings!().tracker.repo, labels: %{}}
   end
+
+  defp repo_config_for_issue(%Issue{repo_id: repo_id, repo_owner: owner, repo_name: name}) do
+    Config.repo_by_id(repo_id || "") ||
+      %{id: repo_id || "github", owner: owner || primary_repo!().owner, name: name || primary_repo!().name, labels: %{}}
+  end
+
+  defp normalize_review_verdict(verdict) when verdict in [:pass, :request_changes, :needs_input], do: Atom.to_string(verdict)
+
+  defp normalize_review_verdict(verdict) when is_binary(verdict) do
+    verdict
+    |> String.trim()
+    |> String.downcase()
+    |> String.replace("-", "_")
+    |> case do
+      "pass" -> "pass"
+      "approved" -> "pass"
+      "approve" -> "pass"
+      "request_changes" -> "request_changes"
+      "changes_requested" -> "request_changes"
+      "fail" -> "request_changes"
+      "failed" -> "request_changes"
+      "needs_input" -> "needs_input"
+      "blocked" -> "needs_input"
+      other -> other
+    end
+  end
+
+  defp normalize_review_verdict(_verdict), do: "needs_input"
+
+  defp review_check_conclusion("pass"), do: "success"
+  defp review_check_conclusion("request_changes"), do: "failure"
+  defp review_check_conclusion("needs_input"), do: "action_required"
+  defp review_check_conclusion(_verdict), do: "action_required"
+
+  defp review_summary(attrs, verdict) do
+    Map.get(attrs, :summary) || Map.get(attrs, "summary") || "Autonomous review verdict: #{verdict}"
+  end
+
+  defp review_details(attrs, fallback) do
+    Map.get(attrs, :details) || Map.get(attrs, "details") || Map.get(attrs, :body) || Map.get(attrs, "body") || fallback
+  end
+
+  defp review_head_sha(%Issue{head_sha: head_sha}, attrs) do
+    case Map.get(attrs, :head_sha) || Map.get(attrs, "head_sha") || head_sha do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, :missing_pr_head_sha}
+    end
+  end
+
+  defp pull_request_review_event("pass"), do: {:ok, "APPROVE"}
+  defp pull_request_review_event("request_changes"), do: {:ok, "REQUEST_CHANGES"}
+  defp pull_request_review_event("needs_input"), do: {:ok, "COMMENT"}
+  defp pull_request_review_event(verdict), do: {:error, {:unsupported_autonomous_review_verdict, verdict}}
+
+  defp ensure_review_approval_allowed("APPROVE") do
+    if Config.independent_github_reviewer?() do
+      :ok
+    else
+      {:error, :reviewer_identity_not_independent}
+    end
+  end
+
+  defp ensure_review_approval_allowed(_event), do: :ok
+
+  defp pull_request_number(%Issue{pr_number: number}) when is_integer(number), do: {:ok, number}
+  defp pull_request_number(%Issue{pr_number: number}) when is_binary(number), do: {:ok, number}
+
+  defp pull_request_number(%Issue{pr_url: pr_url}) when is_binary(pr_url) do
+    case Regex.run(~r{/pull/(\d+)(?:\z|[/?#])}, pr_url) do
+      [_match, number] -> {:ok, number}
+      _ -> {:error, :missing_pull_request_number}
+    end
+  end
+
+  defp pull_request_number(_issue), do: {:error, :missing_pull_request_number}
 
   defp repo_and_issue_number(issue_id) do
     case String.split(issue_id, "#", parts: 2) do

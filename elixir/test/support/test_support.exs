@@ -103,6 +103,10 @@ defmodule SymphonyElixir.TestSupport do
           tracker_repo: nil,
           tracker_label: "symphony",
           tracker_assignee: nil,
+          github_builder_token: nil,
+          github_reviewer_token: nil,
+          github_review_check_name: "symphony/autonomous-review",
+          github_required_check_names: [],
           repos: nil,
           storage_sqlite_path: nil,
           tracker_active_states: ["Todo", "In Progress"],
@@ -135,6 +139,11 @@ defmodule SymphonyElixir.TestSupport do
           observability_enabled: true,
           observability_refresh_ms: 1_000,
           observability_render_interval_ms: 16,
+          evidence_enabled: true,
+          evidence_force_labels: ["evidence-required"],
+          evidence_skip_labels: ["evidence-skip"],
+          evidence_review_gate: "blocking",
+          evidence_max_review_attempts: 2,
           server_port: nil,
           server_host: nil,
           prompt: @workflow_prompt
@@ -151,6 +160,10 @@ defmodule SymphonyElixir.TestSupport do
     tracker_repo = Keyword.get(config, :tracker_repo)
     tracker_label = Keyword.get(config, :tracker_label)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
+    github_builder_token = Keyword.get(config, :github_builder_token)
+    github_reviewer_token = Keyword.get(config, :github_reviewer_token)
+    github_review_check_name = Keyword.get(config, :github_review_check_name)
+    github_required_check_names = Keyword.get(config, :github_required_check_names)
     repos = Keyword.get(config, :repos)
     storage_sqlite_path = Keyword.get(config, :storage_sqlite_path)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
@@ -183,6 +196,11 @@ defmodule SymphonyElixir.TestSupport do
     observability_enabled = Keyword.get(config, :observability_enabled)
     observability_refresh_ms = Keyword.get(config, :observability_refresh_ms)
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
+    evidence_enabled = Keyword.get(config, :evidence_enabled)
+    evidence_force_labels = Keyword.get(config, :evidence_force_labels)
+    evidence_skip_labels = Keyword.get(config, :evidence_skip_labels)
+    evidence_review_gate = Keyword.get(config, :evidence_review_gate)
+    evidence_max_review_attempts = Keyword.get(config, :evidence_max_review_attempts)
     server_port = Keyword.get(config, :server_port)
     server_host = Keyword.get(config, :server_host)
     prompt = Keyword.get(config, :prompt)
@@ -202,6 +220,7 @@ defmodule SymphonyElixir.TestSupport do
         "  assignee: #{yaml_value(tracker_assignee)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
+        github_yaml(github_builder_token, github_reviewer_token, github_review_check_name, github_required_check_names),
         repos_yaml(repos),
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
@@ -228,6 +247,13 @@ defmodule SymphonyElixir.TestSupport do
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
+        evidence_yaml(
+          evidence_enabled,
+          evidence_force_labels,
+          evidence_skip_labels,
+          evidence_review_gate,
+          evidence_max_review_attempts
+        ),
         server_yaml(server_port, server_host),
         storage_yaml(storage_sqlite_path),
         "---",
@@ -254,6 +280,17 @@ defmodule SymphonyElixir.TestSupport do
       end)
 
     Enum.join(["repos:" | repo_lines], "\n")
+  end
+
+  defp github_yaml(builder_token, reviewer_token, review_check_name, required_check_names) do
+    [
+      "github:",
+      "  builder_token: #{yaml_value(builder_token)}",
+      "  reviewer_token: #{yaml_value(reviewer_token)}",
+      "  review_check_name: #{yaml_value(review_check_name)}",
+      "  required_check_names: #{yaml_value(required_check_names)}"
+    ]
+    |> Enum.join("\n")
   end
 
   defp yaml_value(value) when is_binary(value) do
@@ -320,6 +357,18 @@ defmodule SymphonyElixir.TestSupport do
       "  dashboard_enabled: #{yaml_value(enabled)}",
       "  refresh_ms: #{yaml_value(refresh_ms)}",
       "  render_interval_ms: #{yaml_value(render_interval_ms)}"
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp evidence_yaml(enabled, force_labels, skip_labels, review_gate, max_review_attempts) do
+    [
+      "evidence:",
+      "  enabled: #{yaml_value(enabled)}",
+      "  force_labels: #{yaml_value(force_labels)}",
+      "  skip_labels: #{yaml_value(skip_labels)}",
+      "  review_gate: #{yaml_value(review_gate)}",
+      "  max_review_attempts: #{yaml_value(max_review_attempts)}"
     ]
     |> Enum.join("\n")
   end

@@ -79,6 +79,53 @@ defmodule SymphonyElixir.CLITest do
     assert_received {:workflow_set, ^expanded_path}
   end
 
+  test "refuses to start when the checked-out escript is stale" do
+    parent = self()
+
+    deps = %{
+      file_regular?: fn _path -> true end,
+      set_workflow_file_path: fn _path -> :ok end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn _port -> :ok end,
+      validate_runtime_freshness: fn path ->
+        send(parent, {:freshness_checked, path})
+        {:error, "Stale Symphony binary: rebuild required"}
+      end,
+      ensure_all_started: fn ->
+        send(parent, :started)
+        {:ok, [:symphony_elixir]}
+      end
+    }
+
+    assert {:error, message} = CLI.evaluate([@ack_flag, "WORKFLOW.md"], deps)
+    assert message =~ "Stale Symphony binary"
+    assert_received {:freshness_checked, _path}
+    refute_received :started
+  end
+
+  test "--allow-stale-binary bypasses the escript freshness guard" do
+    parent = self()
+
+    deps = %{
+      file_regular?: fn _path -> true end,
+      set_workflow_file_path: fn _path -> :ok end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn _port -> :ok end,
+      validate_runtime_freshness: fn _path ->
+        send(parent, :freshness_checked)
+        {:error, "stale"}
+      end,
+      ensure_all_started: fn ->
+        send(parent, :started)
+        {:ok, [:symphony_elixir]}
+      end
+    }
+
+    assert :ok = CLI.evaluate([@ack_flag, "--allow-stale-binary", "WORKFLOW.md"], deps)
+    refute_received :freshness_checked
+    assert_received :started
+  end
+
   test "accepts --logs-root and passes an expanded root to runtime deps" do
     parent = self()
 

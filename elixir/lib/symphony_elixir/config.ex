@@ -26,6 +26,8 @@ defmodule SymphonyElixir.Config do
           turn_sandbox_policy: map()
         }
 
+  @type github_role :: :builder | :reviewer
+
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
     case Workflow.current() do
@@ -74,6 +76,19 @@ defmodule SymphonyElixir.Config do
   @spec primary_repo() :: map() | nil
   def primary_repo do
     List.first(repos())
+  end
+
+  @spec github_token(github_role()) :: String.t() | nil
+  def github_token(:builder), do: settings!().github.builder_token
+  def github_token(:reviewer), do: settings!().github.reviewer_token
+
+  @spec independent_github_reviewer?() :: boolean()
+  def independent_github_reviewer? do
+    settings = settings!()
+    builder_token = settings.github.builder_token
+    reviewer_token = settings.github.reviewer_token
+
+    is_binary(reviewer_token) and String.trim(reviewer_token) != "" and reviewer_token != builder_token
   end
 
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()

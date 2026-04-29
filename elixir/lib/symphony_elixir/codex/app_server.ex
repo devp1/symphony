@@ -9,8 +9,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @turn_interrupt_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @turn_interrupt_sentinel_interval_ms 500
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
   @github_issue_state_labels ~w(agent-ready in-progress human-review needs-input blocked rework merging)
 
@@ -46,7 +48,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
            {:ok, thread_id, resume_metadata} <-
              do_start_session(port, expanded_workspace, session_policies, Keyword.get(opts, :resume_thread_id)) do
         {:ok,
@@ -86,6 +88,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         opts \\ []
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
+    turn_interrupt_sentinel = Keyword.get(opts, :turn_interrupt_sentinel)
+    turn_interrupt_poll_ms = Keyword.get(opts, :turn_interrupt_poll_ms, @turn_interrupt_sentinel_interval_ms)
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
@@ -108,7 +112,16 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, thread_id) do
+        case await_turn_completion(
+               port,
+               on_message,
+               tool_executor,
+               auto_approve_requests,
+               thread_id,
+               turn_id,
+               turn_interrupt_sentinel,
+               turn_interrupt_poll_ms
+             ) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -266,13 +279,32 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp session_policies(workspace, nil) do
-    Config.codex_runtime_settings(workspace)
+  defp session_policies(workspace, nil, opts) do
+    workspace
+    |> Config.codex_runtime_settings()
+    |> apply_session_policy_overrides(opts)
   end
 
-  defp session_policies(workspace, worker_host) when is_binary(worker_host) do
-    Config.codex_runtime_settings(workspace, remote: true)
+  defp session_policies(workspace, worker_host, opts) when is_binary(worker_host) do
+    workspace
+    |> Config.codex_runtime_settings(remote: true)
+    |> apply_session_policy_overrides(opts)
   end
+
+  defp apply_session_policy_overrides({:ok, policies}, opts) when is_map(policies) and is_list(opts) do
+    overrides =
+      %{}
+      |> maybe_put_policy_override(:approval_policy, Keyword.get(opts, :approval_policy))
+      |> maybe_put_policy_override(:thread_sandbox, Keyword.get(opts, :thread_sandbox))
+      |> maybe_put_policy_override(:turn_sandbox_policy, Keyword.get(opts, :turn_sandbox_policy))
+
+    {:ok, Map.merge(policies, overrides)}
+  end
+
+  defp apply_session_policy_overrides({:error, reason}, _opts), do: {:error, reason}
+
+  defp maybe_put_policy_override(overrides, _key, nil), do: overrides
+  defp maybe_put_policy_override(overrides, key, value), do: Map.put(overrides, key, value)
 
   defp do_start_session(port, workspace, session_policies, resume_thread_id) do
     case send_initialize(port) do
@@ -383,14 +415,23 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, thread_id) do
+  defp await_turn_completion(
+         port,
+         on_message,
+         tool_executor,
+         auto_approve_requests,
+         thread_id,
+         turn_id,
+         turn_interrupt_sentinel,
+         turn_interrupt_poll_ms
+       ) do
     receive_loop(
       port,
       on_message,
       "",
       tool_executor,
       auto_approve_requests,
-      semantic_activity_state(thread_id)
+      semantic_activity_state(thread_id, turn_id, turn_interrupt_sentinel, turn_interrupt_poll_ms)
     )
   end
 
@@ -413,8 +454,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
-      semantic_timeout_remaining_ms(activity) ->
-        {:error, {:semantic_inactivity_timeout, semantic_timeout_payload(activity)}}
+      receive_timeout_ms(activity) ->
+        handle_receive_timeout(port, on_message, pending_line, tool_executor, auto_approve_requests, activity)
     end
   end
 
@@ -423,44 +464,13 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        if foreign_thread_notification?(payload, activity.thread_id) do
-          receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
-        else
-          emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-          {:ok, :turn_completed}
-        end
+        handle_turn_completed(port, on_message, payload, payload_string, tool_executor, auto_approve_requests, activity)
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
-        if foreign_thread_notification?(payload, activity.thread_id) do
-          receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
-        else
-          emit_turn_event(
-            on_message,
-            :turn_failed,
-            payload,
-            payload_string,
-            port,
-            Map.get(payload, "params")
-          )
-
-          {:error, {:turn_failed, Map.get(payload, "params")}}
-        end
+        handle_turn_failed(port, on_message, payload, payload_string, tool_executor, auto_approve_requests, activity)
 
       {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
-        if foreign_thread_notification?(payload, activity.thread_id) do
-          receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
-        else
-          emit_turn_event(
-            on_message,
-            :turn_cancelled,
-            payload,
-            payload_string,
-            port,
-            Map.get(payload, "params")
-          )
-
-          {:error, {:turn_cancelled, Map.get(payload, "params")}}
-        end
+        handle_turn_cancelled(port, on_message, payload, payload_string, tool_executor, auto_approve_requests, activity)
 
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
@@ -507,18 +517,173 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp semantic_activity_state(thread_id) do
+  defp handle_turn_completed(port, on_message, payload, payload_string, tool_executor, auto_approve_requests, activity) do
+    if foreign_thread_notification?(payload, activity.thread_id) do
+      receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+    else
+      emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+      {:ok, turn_completion_result(activity)}
+    end
+  end
+
+  defp handle_turn_failed(port, on_message, payload, payload_string, tool_executor, auto_approve_requests, activity) do
+    if foreign_thread_notification?(payload, activity.thread_id) do
+      receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+    else
+      emit_turn_event(
+        on_message,
+        :turn_failed,
+        payload,
+        payload_string,
+        port,
+        Map.get(payload, "params")
+      )
+
+      {:error, {:turn_failed, Map.get(payload, "params")}}
+    end
+  end
+
+  defp handle_turn_cancelled(port, on_message, payload, payload_string, tool_executor, auto_approve_requests, activity) do
+    if foreign_thread_notification?(payload, activity.thread_id) do
+      receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+    else
+      emit_turn_event(
+        on_message,
+        :turn_cancelled,
+        payload,
+        payload_string,
+        port,
+        Map.get(payload, "params")
+      )
+
+      turn_cancelled_result(activity, Map.get(payload, "params"))
+    end
+  end
+
+  defp semantic_activity_state(thread_id, turn_id, turn_interrupt_sentinel, turn_interrupt_poll_ms) do
     now_ms = System.monotonic_time(:millisecond)
     now = DateTime.utc_now()
 
     %{
       thread_id: thread_id,
+      turn_id: turn_id,
       timeout_ms: Config.settings!().codex.semantic_inactivity_timeout_ms,
       last_at_ms: now_ms,
       last_at: now,
-      last_reason: "turn/start"
+      last_reason: "turn/start",
+      turn_interrupt_sentinel: normalize_turn_interrupt_sentinel(turn_interrupt_sentinel),
+      turn_interrupt_poll_ms: normalize_turn_interrupt_poll_ms(turn_interrupt_poll_ms),
+      turn_interrupt_requested: nil
     }
   end
+
+  defp normalize_turn_interrupt_sentinel(sentinel) when is_function(sentinel, 0), do: sentinel
+  defp normalize_turn_interrupt_sentinel(_sentinel), do: nil
+
+  defp normalize_turn_interrupt_poll_ms(poll_ms) when is_integer(poll_ms) and poll_ms > 0, do: poll_ms
+  defp normalize_turn_interrupt_poll_ms(_poll_ms), do: @turn_interrupt_sentinel_interval_ms
+
+  defp receive_timeout_ms(%{turn_interrupt_sentinel: sentinel, turn_interrupt_requested: nil} = activity)
+       when is_function(sentinel, 0) do
+    min(semantic_timeout_remaining_ms(activity), activity.turn_interrupt_poll_ms)
+  end
+
+  defp receive_timeout_ms(activity), do: semantic_timeout_remaining_ms(activity)
+
+  defp handle_receive_timeout(port, on_message, pending_line, tool_executor, auto_approve_requests, activity) do
+    if semantic_timeout_remaining_ms(activity) <= 0 do
+      {:error, {:semantic_inactivity_timeout, semantic_timeout_payload(activity)}}
+    else
+      case maybe_interrupt_for_sentinel(port, on_message, activity) do
+        {:ok, activity} ->
+          receive_loop(port, on_message, pending_line, tool_executor, auto_approve_requests, activity)
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp maybe_interrupt_for_sentinel(
+         port,
+         on_message,
+         %{turn_interrupt_sentinel: sentinel, turn_interrupt_requested: nil} = activity
+       )
+       when is_function(sentinel, 0) do
+    case sentinel.() do
+      {:interrupt, reason, details} ->
+        request_turn_interrupt(port, on_message, activity, reason, details)
+
+      {:interrupt, reason} ->
+        request_turn_interrupt(port, on_message, activity, reason, %{})
+
+      :continue ->
+        {:ok, activity}
+
+      nil ->
+        {:ok, activity}
+
+      other ->
+        {:error, {:invalid_turn_interrupt_sentinel_result, other}}
+    end
+  rescue
+    error -> {:error, {:turn_interrupt_sentinel_failed, Exception.message(error)}}
+  end
+
+  defp maybe_interrupt_for_sentinel(_port, _on_message, activity), do: {:ok, activity}
+
+  defp request_turn_interrupt(port, on_message, activity, reason, details) do
+    payload = %{
+      "method" => "turn/interrupt",
+      "id" => @turn_interrupt_id,
+      "params" => %{
+        "threadId" => activity.thread_id,
+        "turnId" => activity.turn_id
+      }
+    }
+
+    send_message(port, payload)
+
+    interrupt = %{
+      reason: reason,
+      details: details,
+      requested_at: DateTime.utc_now(),
+      thread_id: activity.thread_id,
+      turn_id: activity.turn_id
+    }
+
+    emit_message(
+      on_message,
+      :turn_interrupt_requested,
+      %{
+        reason: reason,
+        details: details,
+        payload: payload
+      },
+      metadata_from_message(port, payload)
+    )
+
+    {:ok,
+     %{
+       activity
+       | turn_interrupt_requested: interrupt,
+         last_at_ms: System.monotonic_time(:millisecond),
+         last_at: interrupt.requested_at,
+         last_reason: "turn interrupt requested"
+     }}
+  end
+
+  defp turn_completion_result(%{turn_interrupt_requested: interrupt}) when is_map(interrupt) do
+    {:turn_interrupted, interrupt}
+  end
+
+  defp turn_completion_result(_activity), do: :turn_completed
+
+  defp turn_cancelled_result(%{turn_interrupt_requested: interrupt} = activity, _params) when is_map(interrupt) do
+    {:ok, turn_completion_result(activity)}
+  end
+
+  defp turn_cancelled_result(_activity, params), do: {:error, {:turn_cancelled, params}}
 
   defp semantic_timeout_remaining_ms(%{timeout_ms: timeout_ms, last_at_ms: last_at_ms}) do
     elapsed_ms = System.monotonic_time(:millisecond) - last_at_ms

@@ -375,6 +375,107 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert :ok = GitHubClient.preflight()
   end
 
+  test "github command environment selects builder and reviewer tokens" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_builder_token: "builder-token",
+      github_reviewer_token: "reviewer-token"
+    )
+
+    assert [{"GH_TOKEN", "builder-token"}, {"GITHUB_TOKEN", "builder-token"}] =
+             GitHubClient.command_env_for_test(:builder)
+
+    assert [{"GH_TOKEN", "reviewer-token"}, {"GITHUB_TOKEN", "reviewer-token"}] =
+             GitHubClient.command_env_for_test(:reviewer)
+  end
+
+  test "autonomous review check is written with reviewer identity" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_builder_token: "builder-token",
+      github_reviewer_token: "reviewer-token"
+    )
+
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :github_command_fun, fn args, env ->
+      send(parent, {:gh_args, args, env})
+      {Jason.encode!(%{"id" => 123}), 0}
+    end)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
+
+    issue = %Issue{
+      id: "25",
+      identifier: "GH-25",
+      title: "Review me",
+      repo_owner: "devp1",
+      repo_name: "Beacon",
+      head_sha: "abc123"
+    }
+
+    assert :ok =
+             GitHubClient.upsert_autonomous_review_check(issue, %{
+               verdict: "request_changes",
+               summary: "Needs one fix",
+               details: "A specific issue remains."
+             })
+
+    assert_received {:gh_args, args, [{"GH_TOKEN", "reviewer-token"}, {"GITHUB_TOKEN", "reviewer-token"}]}
+    assert ["api", "repos/devp1/Beacon/check-runs" | _] = args
+    assert "conclusion=failure" in args
+    assert "name=symphony/autonomous-review" in args
+  end
+
+  test "pass review approval requires independent reviewer identity" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_builder_token: "same-token",
+      github_reviewer_token: "same-token"
+    )
+
+    issue = %Issue{
+      id: "25",
+      identifier: "GH-25",
+      title: "Review me",
+      repo_owner: "devp1",
+      repo_name: "Beacon",
+      pr_url: "https://github.com/devp1/Beacon/pull/25"
+    }
+
+    assert {:error, :reviewer_identity_not_independent} =
+             GitHubClient.submit_autonomous_pr_review(issue, %{verdict: "pass", summary: "Clean"})
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_builder_token: "builder-token",
+      github_reviewer_token: "reviewer-token"
+    )
+
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :github_command_fun, fn args, env ->
+      send(parent, {:gh_args, args, env})
+      {Jason.encode!(%{"id" => 456}), 0}
+    end)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
+
+    assert :ok = GitHubClient.submit_autonomous_pr_review(issue, %{verdict: "pass", summary: "Clean"})
+
+    assert_received {:gh_args, args, [{"GH_TOKEN", "reviewer-token"}, {"GITHUB_TOKEN", "reviewer-token"}]}
+    assert ["api", "repos/devp1/Beacon/pulls/25/reviews" | _] = args
+    assert "event=APPROVE" in args
+  end
+
   test "preflight fails when gh auth is unavailable" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",

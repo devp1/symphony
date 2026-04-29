@@ -2041,4 +2041,103 @@ defmodule SymphonyElixir.AppServerTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "app server interrupts an active turn when a sentinel fires" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-turn-sentinel-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "GH-HANDOFF")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+      marker_path = Path.join(workspace, ".symphony/handoff.json")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-turn-sentinel.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-handoff"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-handoff"}}}'
+            mkdir -p .symphony
+            printf '%s\\n' '{"ready":true,"state":"human-review","reason":"pr-ready"}' > .symphony/handoff.json
+            ;;
+          5)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-handoff","turn":{"id":"turn-handoff","status":"interrupted"}}}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{id: "issue-handoff", identifier: "GH-HANDOFF", title: "Handoff", state: "In Progress"}
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      sentinel = fn ->
+        if File.regular?(marker_path) do
+          {:interrupt, :handoff_ready, %{marker_path: marker_path}}
+        else
+          :continue
+        end
+      end
+
+      assert {:ok, turn} =
+               AppServer.run(workspace, "finish handoff", issue,
+                 on_message: on_message,
+                 turn_interrupt_sentinel: sentinel,
+                 turn_interrupt_poll_ms: 10
+               )
+
+      assert {:turn_interrupted, %{reason: :handoff_ready, turn_id: "turn-handoff"}} = turn.result
+      assert_received {:app_server_message, %{event: :turn_interrupt_requested, reason: :handoff_ready}}
+
+      lines =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      assert Enum.any?(lines, fn payload ->
+               payload["method"] == "turn/interrupt" &&
+                 get_in(payload, ["params", "threadId"]) == "thread-handoff" &&
+                 get_in(payload, ["params", "turnId"]) == "turn-handoff"
+             end)
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
 end

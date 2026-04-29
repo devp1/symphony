@@ -62,7 +62,6 @@ defmodule SymphonyElixir.RunLedger do
 
   @spec persist_codex_update(running_entry(), map()) :: :ok
   def persist_codex_update(%{run_id: run_id} = running_entry, update) when is_binary(run_id) do
-    event = update[:event] || Map.get(update, :event)
     message = StatusDashboard.humanize_codex_message(Map.get(running_entry, :last_codex_message))
     session_state = Map.get(running_entry, :session_state)
 
@@ -82,7 +81,7 @@ defmodule SymphonyElixir.RunLedger do
       |> Map.merge(run_pr_metadata_attrs(Map.get(running_entry, :issue)))
     )
 
-    Storage.append_event(run_id, "info", to_string(message || event || "codex update"), update)
+    Storage.append_event(run_id, "info", message, update)
     :ok
   end
 

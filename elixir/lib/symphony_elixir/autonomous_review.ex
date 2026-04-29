@@ -29,6 +29,13 @@ defmodule SymphonyElixir.AutonomousReview do
           required(:review_stale?) => boolean()
         }
 
+  # The review adapter is intentionally injectable for non-Codex reviewers and
+  # test fakes; Dialyzer only sees the default app-server path here.
+  @dialyzer {:nowarn_function, review_and_publish: 3}
+  @dialyzer {:nowarn_function, issue_with_review_head: 2}
+  @dialyzer {:nowarn_function, review_with_context: 2}
+  @dialyzer {:nowarn_function, maybe_put_review_context: 3}
+
   @spec review_pr(Path.t(), Issue.t(), keyword()) :: {:ok, review_attrs()} | {:error, term()}
   def review_pr(workspace, %Issue{} = issue, opts \\ []) when is_binary(workspace) do
     review_dir = Keyword.get(opts, :review_dir, Path.join(workspace, @review_artifact_dir))
@@ -62,11 +69,17 @@ defmodule SymphonyElixir.AutonomousReview do
 
   @spec review_and_publish(Path.t(), Issue.t(), keyword()) :: {:ok, review_attrs()} | {:error, term()}
   def review_and_publish(workspace, %Issue{} = issue, opts \\ []) when is_binary(workspace) do
-    with {:ok, review} <- review_pr(workspace, issue, opts),
-         review <- review_with_context(review, opts),
-         issue <- issue_with_review_head(issue, review),
-         :ok <- publish(issue, review) do
-      {:ok, review}
+    case review_pr(workspace, issue, opts) do
+      {:ok, review} ->
+        review = review_with_context(review, opts)
+        issue = issue_with_review_head(issue, review)
+
+        with :ok <- publish(issue, review) do
+          {:ok, review}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -78,21 +91,21 @@ defmodule SymphonyElixir.AutonomousReview do
     |> String.trim()
     |> String.downcase()
     |> String.replace("-", "_")
-    |> case do
-      "pass" -> "pass"
-      "approved" -> "pass"
-      "approve" -> "pass"
-      "request_changes" -> "request_changes"
-      "changes_requested" -> "request_changes"
-      "fail" -> "request_changes"
-      "failed" -> "request_changes"
-      "needs_input" -> "needs_input"
-      "blocked" -> "needs_input"
-      _ -> "needs_input"
-    end
+    |> normalized_verdict_alias()
   end
 
   def normalize_verdict(_verdict), do: "needs_input"
+
+  defp normalized_verdict_alias("pass"), do: "pass"
+  defp normalized_verdict_alias("approved"), do: "pass"
+  defp normalized_verdict_alias("approve"), do: "pass"
+  defp normalized_verdict_alias("request_changes"), do: "request_changes"
+  defp normalized_verdict_alias("changes_requested"), do: "request_changes"
+  defp normalized_verdict_alias("fail"), do: "request_changes"
+  defp normalized_verdict_alias("failed"), do: "request_changes"
+  defp normalized_verdict_alias("needs_input"), do: "needs_input"
+  defp normalized_verdict_alias("blocked"), do: "needs_input"
+  defp normalized_verdict_alias(_verdict), do: "needs_input"
 
   @spec check_conclusion(verdict() | String.t() | atom()) :: String.t()
   def check_conclusion(verdict) do
@@ -107,25 +120,32 @@ defmodule SymphonyElixir.AutonomousReview do
   def record(%Issue{} = issue, attrs) when is_map(attrs) do
     verdict = normalize_verdict(Map.get(attrs, :verdict) || Map.get(attrs, "verdict"))
     head_sha = Map.get(attrs, :head_sha) || Map.get(attrs, "head_sha") || issue.head_sha
-    stale = stale_review?(issue, head_sha)
 
-    Storage.record_autonomous_review(%{
-      run_id: Map.get(attrs, :run_id) || Map.get(attrs, "run_id"),
-      issue_session_id: Map.get(attrs, :issue_session_id) || Map.get(attrs, "issue_session_id"),
+    Storage.record_autonomous_review(record_attrs(issue, attrs, verdict, head_sha))
+  end
+
+  defp record_attrs(%Issue{} = issue, attrs, verdict, head_sha) do
+    %{
+      run_id: attr(attrs, :run_id),
+      issue_session_id: attr(attrs, :issue_session_id),
       repo_id: issue.repo_id,
       issue_number: issue.number,
       issue_identifier: issue.identifier,
       pr_url: issue.pr_url,
       head_sha: head_sha,
-      reviewer_kind: Map.get(attrs, :reviewer_kind) || Map.get(attrs, "reviewer_kind") || "review-agent",
+      reviewer_kind: attr(attrs, :reviewer_kind) || "review-agent",
       verdict: verdict,
-      summary: Map.get(attrs, :summary) || Map.get(attrs, "summary"),
-      findings: Map.get(attrs, :findings) || Map.get(attrs, "findings") || [],
+      summary: attr(attrs, :summary),
+      findings: attr(attrs, :findings) || [],
       check_name: Config.settings!().github.review_check_name,
       check_conclusion: check_conclusion(verdict),
-      stale: stale,
-      output_path: Map.get(attrs, :output_path) || Map.get(attrs, "output_path")
-    })
+      stale: stale_review?(issue, head_sha),
+      output_path: attr(attrs, :output_path)
+    }
+  end
+
+  defp attr(attrs, key) when is_map(attrs) and is_atom(key) do
+    Map.get(attrs, key) || Map.get(attrs, Atom.to_string(key))
   end
 
   @spec publish(Issue.t(), review_attrs()) :: :ok | {:error, term()}
@@ -320,8 +340,6 @@ defmodule SymphonyElixir.AutonomousReview do
         {:error, reason}
     end
   end
-
-  defp parse_review_text(_text), do: {:error, :missing_autonomous_review_text}
 
   defp normalize_review(%{} = review) do
     verdict = normalize_verdict(Map.get(review, "verdict") || Map.get(review, :verdict))

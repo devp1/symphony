@@ -164,27 +164,33 @@ defmodule SymphonyElixir.IssueSession do
   end
 
   defp run_active_cycle(%__MODULE__{} = state) do
-    with {:ok, state} <- ensure_workspace(state) do
-      case apply_startup_handoff(state) do
-        {:continue, state} ->
-          run_cycle_after_startup_handoff(state)
+    case ensure_workspace(state) do
+      {:ok, state} ->
+        run_active_cycle_with_workspace(state)
 
-        {:continue_with_prompt, state, prompt} ->
-          state
-          |> Map.put(:cycle_kind, {:evidence_feedback, prompt})
-          |> run_cycle_after_startup_handoff()
+      {:error, reason} ->
+        {:error, state, reason}
+    end
+  end
 
-        {:park, state, reason} ->
-          {:park, state, reason}
+  defp run_active_cycle_with_workspace(%__MODULE__{} = state) do
+    case apply_startup_handoff(state) do
+      {:continue, state} ->
+        run_cycle_after_startup_handoff(state)
 
-        {:stop, state, reason} ->
-          {:stop, state, reason}
+      {:continue_with_prompt, state, prompt} ->
+        state
+        |> Map.put(:cycle_kind, {:evidence_feedback, prompt})
+        |> run_cycle_after_startup_handoff()
 
-        {:error, reason} ->
-          {:error, state, reason}
-      end
-    else
-      {:error, reason} -> {:error, state, reason}
+      {:park, state, reason} ->
+        {:park, state, reason}
+
+      {:stop, state, reason} ->
+        {:stop, state, reason}
+
+      {:error, reason} ->
+        {:error, state, reason}
     end
   end
 
@@ -466,8 +472,6 @@ defmodule SymphonyElixir.IssueSession do
     end
   end
 
-  defp maybe_apply_verified_handoff(state), do: {:ok, state}
-
   defp handoff_interrupt_sentinel(%{workspace: workspace, worker_host: nil} = state)
        when is_binary(workspace) do
     fn ->
@@ -560,8 +564,6 @@ defmodule SymphonyElixir.IssueSession do
         :ok
     end
   end
-
-  defp clear_verified_handoff_marker(_state, _payload), do: :ok
 
   defp maybe_gate_human_review_handoff(state, handoff, "Human Review", payload) do
     decision = Evidence.decision(state.workspace, state.issue, handoff)
@@ -742,8 +744,6 @@ defmodule SymphonyElixir.IssueSession do
     """)
   end
 
-  defp write_autonomous_review_feedback_file(_workspace, _review, _reason), do: :ok
-
   defp report_autonomous_review_needs_input(%{issue: %Issue{id: issue_id}} = state, handoff, review, reason)
        when is_binary(issue_id) do
     _ =
@@ -778,10 +778,6 @@ defmodule SymphonyElixir.IssueSession do
     end
   end
 
-  defp report_autonomous_review_needs_input(state, _handoff, _review, reason) do
-    {:error, {:autonomous_review_failed, reason, state.issue}}
-  end
-
   defp autonomous_review_needs_input_comment(state, handoff, review, reason) do
     """
     ## Symphony autonomous review needs input
@@ -791,7 +787,7 @@ defmodule SymphonyElixir.IssueSession do
     - Issue: `#{state.issue.identifier || state.issue.id}`
     - Run: `#{state.run_id || "unknown"}`
     - Issue session: `#{state.issue_session_id || "unknown"}`
-    - Workspace: `#{state.workspace || "unknown"}`
+    - Workspace: `#{state.workspace}`
     - PR: `#{state.issue.pr_url || Map.get(handoff, :pr_url) || "unknown"}`
     - Review verdict: `#{review_value(review, :verdict) || "needs_input"}`
     - Summary: #{review_value(review, :summary) || inspect(reason)}
@@ -983,8 +979,6 @@ defmodule SymphonyElixir.IssueSession do
     File.write(feedback_path, Evidence.feedback_markdown(review, reason))
   end
 
-  defp write_evidence_feedback_file(_workspace, _review, _reason), do: :ok
-
   defp remove_handoff_marker(%{workspace: workspace}) when is_binary(workspace) do
     case File.rm(Handoff.path(workspace)) do
       :ok -> :ok
@@ -1013,8 +1007,6 @@ defmodule SymphonyElixir.IssueSession do
     end
   end
 
-  defp report_evidence_needs_input(state, _handoff, _review, reason), do: {:error, {:evidence_review_failed, reason, state.issue}}
-
   defp evidence_needs_input_comment(state, handoff, review, reason) do
     """
     ## Symphony evidence review needs input
@@ -1024,7 +1016,7 @@ defmodule SymphonyElixir.IssueSession do
     - Issue: `#{state.issue.identifier || state.issue.id}`
     - Run: `#{state.run_id || "unknown"}`
     - Issue session: `#{state.issue_session_id || "unknown"}`
-    - Workspace: `#{state.workspace || "unknown"}`
+    - Workspace: `#{state.workspace}`
     - PR: `#{state.issue.pr_url || Map.get(handoff, :pr_url) || "unknown"}`
     - Review verdict: `#{Map.get(review, :verdict, "request_changes")}`
     - Summary: #{Map.get(review, :summary) || inspect(reason)}
@@ -1092,10 +1084,7 @@ defmodule SymphonyElixir.IssueSession do
   end
 
   defp initial_cycle_kind(opts) do
-    cond do
-      Keyword.has_key?(opts, :restart_capsule) -> :restart
-      true -> :initial
-    end
+    if Keyword.has_key?(opts, :restart_capsule), do: :restart, else: :initial
   end
 
   defp issue_state_fetcher(opts) do
@@ -1144,6 +1133,10 @@ defmodule SymphonyElixir.IssueSession do
 
   defp restart_prompt(%Issue{} = issue, opts) do
     capsule = Keyword.get(opts, :restart_capsule, %{})
+    workspace_path = capsule_value(capsule, :workspace_path) || "unknown"
+    pr_url = issue.pr_url || capsule_value(capsule, :pr_url) || "unknown"
+    stop_reason = capsule_value(capsule, :stop_reason) || "unknown"
+    resume_thread_id = Keyword.get(opts, :resume_thread_id) || "unknown"
 
     """
     Symphony restart continuation:
@@ -1151,10 +1144,10 @@ defmodule SymphonyElixir.IssueSession do
     - Symphony restarted while this issue session was active or parked.
     - Issue: #{issue.identifier || issue.id} — #{issue.title}
     - Current issue state: #{issue.state}
-    - Workspace: #{Map.get(capsule, :workspace_path) || Map.get(capsule, "workspace_path") || "unknown"}
-    - Prior Codex thread id: #{Keyword.get(opts, :resume_thread_id) || "unknown"}
-    - PR URL, if known: #{issue.pr_url || Map.get(capsule, :pr_url) || Map.get(capsule, "pr_url") || "unknown"}
-    - Prior interruption reason: #{Map.get(capsule, :stop_reason) || Map.get(capsule, "stop_reason") || "unknown"}
+    - Workspace: #{workspace_path}
+    - Prior Codex thread id: #{resume_thread_id}
+    - PR URL, if known: #{pr_url}
+    - Prior interruption reason: #{stop_reason}
 
     Continue from the preserved workspace and restored thread if available.
 
@@ -1163,6 +1156,12 @@ defmodule SymphonyElixir.IssueSession do
     Only restart broad discovery when the workspace has no useful artifact or the existing artifact is clearly wrong. Keep working autonomously toward a validated PR-ready handoff unless you are blocked by missing auth/secrets, required human input, or a real product decision the issue cannot answer.
     """
   end
+
+  defp capsule_value(capsule, key) when is_map(capsule) and is_atom(key) do
+    Map.get(capsule, key) || Map.get(capsule, Atom.to_string(key))
+  end
+
+  defp capsule_value(_capsule, _key), do: nil
 
   defp codex_message_handler(recipient, issue) do
     fn message ->
@@ -1309,7 +1308,7 @@ defmodule SymphonyElixir.IssueSession do
 
   defp stop_app_session(state), do: state
 
-  defp record_resume_metadata(%__MODULE__{} = state, %{metadata: metadata}) when is_map(metadata) do
+  defp record_resume_metadata(%__MODULE__{} = state, %{metadata: metadata} = app_session) when is_map(metadata) do
     if Map.get(metadata, :resume_attempted) do
       level = if Map.get(metadata, :resume_succeeded), do: "info", else: "warning"
       message = if Map.get(metadata, :resume_succeeded), do: "codex thread resumed", else: "codex thread resume failed; started new thread"
@@ -1317,7 +1316,7 @@ defmodule SymphonyElixir.IssueSession do
       Storage.append_event(state.run_id, level, message, %{
         issue_session_id: state.issue_session_id,
         requested_thread_id: Keyword.get(state.opts, :resume_thread_id),
-        active_thread_id: Map.get(state.app_session || %{}, :thread_id),
+        active_thread_id: Map.get(app_session, :thread_id),
         resume_failure_reason: Map.get(metadata, :resume_failure_reason)
       })
     end

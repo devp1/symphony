@@ -2967,7 +2967,11 @@ defmodule SymphonyElixir.CoreTest do
       first_running_entry = first_updated_state.running[issue_id]
 
       assert first_running_entry.artifact_baseline_total_tokens == 200
-      assert match?({:git_status, value} when is_integer(value), first_running_entry.last_workspace_artifact_fingerprint)
+
+      assert match?(
+               {:git_status, value} when is_integer(value),
+               first_running_entry.last_workspace_artifact_fingerprint
+             )
 
       second_running_entry = %{first_running_entry | codex_total_tokens: 350}
       second_state = %{first_updated_state | running: %{issue_id => second_running_entry}}

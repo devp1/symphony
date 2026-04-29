@@ -4,20 +4,25 @@ defmodule SymphonyElixir.GitHub.Client do
   """
 
   alias SymphonyElixir.{Config, Linear.Issue, Storage}
+  alias SymphonyElixir.Config.Schema
 
   @type github_role :: Config.github_role()
 
   @spec preflight() :: :ok | {:error, term()}
   def preflight do
-    with :ok <- gh_auth_preflight() do
-      Config.repos()
-      |> Enum.reduce_while(:ok, fn repo_config, :ok ->
-        case repo_preflight(repo_config) do
-          :ok -> {:cont, :ok}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
-      end)
+    case gh_auth_preflight() do
+      :ok -> preflight_repos(Config.repos())
+      {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp preflight_repos(repos) do
+    Enum.reduce_while(repos, :ok, fn repo_config, :ok ->
+      case repo_preflight(repo_config) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
@@ -110,7 +115,9 @@ defmodule SymphonyElixir.GitHub.Client do
         close_issue(repo_config, issue_number)
 
       state_name ->
-        with :ok <- open_issue(repo_config, issue_number), do: replace_state_label(repo_config, issue_number, state_name)
+        with :ok <- open_issue(repo_config, issue_number) do
+          replace_state_label(repo_config, issue_number, state_name)
+        end
     end
   end
 
@@ -634,28 +641,27 @@ defmodule SymphonyElixir.GitHub.Client do
       %{id: repo_id || "github", owner: owner || primary_repo!().owner, name: name || primary_repo!().name, labels: %{}}
   end
 
-  defp normalize_review_verdict(verdict) when verdict in [:pass, :request_changes, :needs_input], do: Atom.to_string(verdict)
+  defp normalize_review_verdict(verdict) when verdict in [:pass, :request_changes, :needs_input] do
+    Atom.to_string(verdict)
+  end
 
   defp normalize_review_verdict(verdict) when is_binary(verdict) do
     verdict
     |> String.trim()
     |> String.downcase()
     |> String.replace("-", "_")
-    |> case do
-      "pass" -> "pass"
-      "approved" -> "pass"
-      "approve" -> "pass"
-      "request_changes" -> "request_changes"
-      "changes_requested" -> "request_changes"
-      "fail" -> "request_changes"
-      "failed" -> "request_changes"
-      "needs_input" -> "needs_input"
-      "blocked" -> "needs_input"
-      other -> other
-    end
+    |> normalized_review_verdict_alias()
   end
 
   defp normalize_review_verdict(_verdict), do: "needs_input"
+
+  defp normalized_review_verdict_alias("approved"), do: "pass"
+  defp normalized_review_verdict_alias("approve"), do: "pass"
+  defp normalized_review_verdict_alias("changes_requested"), do: "request_changes"
+  defp normalized_review_verdict_alias("fail"), do: "request_changes"
+  defp normalized_review_verdict_alias("failed"), do: "request_changes"
+  defp normalized_review_verdict_alias("blocked"), do: "needs_input"
+  defp normalized_review_verdict_alias(verdict), do: verdict
 
   defp review_check_conclusion("pass"), do: "success"
   defp review_check_conclusion("request_changes"), do: "failure"
@@ -725,7 +731,7 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp repo_labels(repo_config) do
-    Map.merge(SymphonyElixir.Config.Schema.default_github_labels(), Map.get(repo_config, :labels, %{}) || %{})
+    Map.merge(Schema.default_github_labels(), Map.get(repo_config, :labels, %{}) || %{})
   end
 
   defp state_label_map(repo_config) do

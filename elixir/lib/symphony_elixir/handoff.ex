@@ -46,7 +46,6 @@ defmodule SymphonyElixir.Handoff do
     else
       false -> :missing
       {:error, reason} -> {:error, reason}
-      other -> {:error, {:invalid_handoff, other}}
     end
   rescue
     error -> {:error, {:handoff_read_failed, Exception.message(error)}}
@@ -200,9 +199,7 @@ defmodule SymphonyElixir.Handoff do
 
   defp maybe_put_boolean(map, _key, nil), do: map
   defp maybe_put_boolean(map, key, value) when is_boolean(value), do: Map.put(map, key, value)
-  defp maybe_put_boolean(map, _key, _value), do: map
 
   defp maybe_put_string(map, _key, nil), do: map
   defp maybe_put_string(map, key, value) when is_binary(value), do: Map.put(map, key, value)
-  defp maybe_put_string(map, _key, _value), do: map
 end

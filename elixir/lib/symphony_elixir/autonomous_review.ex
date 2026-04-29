@@ -155,9 +155,8 @@ defmodule SymphonyElixir.AutonomousReview do
 
     with :ok <- ensure_publishable_reviewer_identity(verdict),
          :ok <- GitHub.Client.submit_autonomous_pr_review(issue, attrs),
-         {:ok, _review_id} <- record(issue, attrs),
-         :ok <- GitHub.Client.upsert_autonomous_review_check(issue, attrs) do
-      :ok
+         {:ok, _review_id} <- record(issue, attrs) do
+      GitHub.Client.upsert_autonomous_review_check(issue, attrs)
     end
   end
 
@@ -187,6 +186,43 @@ defmodule SymphonyElixir.AutonomousReview do
       review_stale?: review_stale?
     }
   end
+
+  @spec issue_from_snapshot(map()) :: Issue.t()
+  def issue_from_snapshot(%{} = issue_snapshot) do
+    %Issue{
+      id: snapshot_issue_id(issue_snapshot),
+      identifier: Map.get(issue_snapshot, "identifier"),
+      title: Map.get(issue_snapshot, "title"),
+      state: Map.get(issue_snapshot, "state"),
+      url: Map.get(issue_snapshot, "url"),
+      repo_id: Map.get(issue_snapshot, "repo_id"),
+      number: snapshot_issue_number(issue_snapshot),
+      labels: Map.get(issue_snapshot, "labels") || [],
+      pr_url: Map.get(issue_snapshot, "pr_url"),
+      head_sha: Map.get(issue_snapshot, "head_sha"),
+      pr_state: Map.get(issue_snapshot, "pr_state"),
+      check_state: Map.get(issue_snapshot, "check_state"),
+      review_state: Map.get(issue_snapshot, "review_state")
+    }
+  end
+
+  defp snapshot_issue_id(%{"repo_id" => repo_id, "number" => number}) when is_binary(repo_id) and is_integer(number) do
+    "#{repo_id}##{number}"
+  end
+
+  defp snapshot_issue_id(%{"identifier" => identifier}) when is_binary(identifier), do: identifier
+  defp snapshot_issue_id(_issue_snapshot), do: "unknown"
+
+  defp snapshot_issue_number(%{"number" => number}) when is_integer(number), do: number
+
+  defp snapshot_issue_number(%{"number" => number}) when is_binary(number) do
+    case Integer.parse(number) do
+      {parsed, ""} -> parsed
+      _ -> nil
+    end
+  end
+
+  defp snapshot_issue_number(_issue_snapshot), do: nil
 
   defp maybe_reason(reasons, true, reason), do: [reason | reasons]
   defp maybe_reason(reasons, _condition, _reason), do: reasons

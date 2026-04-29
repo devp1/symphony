@@ -2007,6 +2007,130 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "merge_issue_pr blocks before GitHub merge when merge gate is not ready" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_builder_token: "builder-token",
+      github_reviewer_token: "reviewer-token"
+    )
+
+    :ok =
+      SymphonyElixir.Storage.record_issue_snapshot(%{
+        repo_id: "beacon",
+        number: 31,
+        identifier: "GH-31",
+        title: "Blocked merge",
+        state: "Human Review",
+        labels: ["symphony", "human-review"],
+        pr_url: "https://github.com/devp1/Beacon/pull/31",
+        head_sha: "abc123",
+        pr_state: "OPEN",
+        check_state: "pending",
+        review_state: "APPROVED"
+      })
+
+    assert {:ok, _review_id} =
+             SymphonyElixir.Storage.record_autonomous_review(%{
+               id: "blocked-review",
+               repo_id: "beacon",
+               issue_number: 31,
+               issue_identifier: "GH-31",
+               pr_url: "https://github.com/devp1/Beacon/pull/31",
+               head_sha: "abc123",
+               reviewer_kind: "review-agent",
+               verdict: "pass",
+               summary: "clean",
+               check_name: "symphony/autonomous-review",
+               check_conclusion: "success",
+               stale: false
+             })
+
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :github_command_fun, fn args, _env ->
+      send(parent, {:unexpected_gh_merge, args})
+      {Jason.encode!(%{"merged" => true}), 0}
+    end)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
+
+    state = %Orchestrator.State{
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:reply, {:error, {:merge_gate_blocked, reasons}}, ^state} =
+             Orchestrator.handle_call({:merge_issue_pr, "beacon", 31}, self(), state)
+
+    assert "ci-not-green" in reasons
+    refute_receive {:unexpected_gh_merge, _args}
+  end
+
+  test "merge_issue_pr merges ready PRs through the builder GitHub identity" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_builder_token: "builder-token",
+      github_reviewer_token: "reviewer-token"
+    )
+
+    :ok =
+      SymphonyElixir.Storage.record_issue_snapshot(%{
+        repo_id: "beacon",
+        number: 32,
+        identifier: "GH-32",
+        title: "Ready merge",
+        state: "Human Review",
+        labels: ["symphony", "human-review"],
+        pr_url: "https://github.com/devp1/Beacon/pull/32",
+        head_sha: "def456",
+        pr_state: "OPEN",
+        check_state: "passing",
+        review_state: "APPROVED"
+      })
+
+    assert {:ok, _review_id} =
+             SymphonyElixir.Storage.record_autonomous_review(%{
+               id: "ready-review",
+               repo_id: "beacon",
+               issue_number: 32,
+               issue_identifier: "GH-32",
+               pr_url: "https://github.com/devp1/Beacon/pull/32",
+               head_sha: "def456",
+               reviewer_kind: "review-agent",
+               verdict: "pass",
+               summary: "clean",
+               check_name: "symphony/autonomous-review",
+               check_conclusion: "success",
+               stale: false
+             })
+
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :github_command_fun, fn args, env ->
+      send(parent, {:gh_merge_args, args, env})
+      {Jason.encode!(%{"merged" => true}), 0}
+    end)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
+
+    state = %Orchestrator.State{
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:reply, {:ok, payload}, ^state} =
+             Orchestrator.handle_call({:merge_issue_pr, "beacon", 32}, self(), state)
+
+    assert payload.issue_identifier == "GH-32"
+    assert payload.merge_response == %{"merged" => true}
+
+    assert_received {:gh_merge_args, args, [{"GH_TOKEN", "builder-token"}, {"GITHUB_TOKEN", "builder-token"}]}
+    assert ["api", "repos/devp1/Beacon/pulls/32/merge" | _] = args
+    assert "sha=def456" in args
+  end
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
     scheduling_tolerance_ms = 500

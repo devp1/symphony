@@ -4,7 +4,6 @@ defmodule SymphonyElixirWeb.Presenter do
   """
 
   alias SymphonyElixir.{AutonomousReview, Config, Orchestrator, StatusDashboard, Storage}
-  alias SymphonyElixir.Linear.Issue
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -162,7 +161,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp put_merge_gate(%{} = issue_snapshot, latest_reviews) do
     review = Map.get(latest_reviews, {Map.get(issue_snapshot, "repo_id"), Map.get(issue_snapshot, "number")})
-    gate = AutonomousReview.merge_gate(issue_from_snapshot(issue_snapshot), review)
+    gate = AutonomousReview.merge_gate(AutonomousReview.issue_from_snapshot(issue_snapshot), review)
 
     Map.put(issue_snapshot, "merge_gate", %{
       "ready" => gate.ready?,
@@ -176,31 +175,6 @@ defmodule SymphonyElixirWeb.Presenter do
       "review_state" => Map.get(issue_snapshot, "review_state")
     })
   end
-
-  defp issue_from_snapshot(%{} = issue_snapshot) do
-    %Issue{
-      id: snapshot_issue_id(issue_snapshot),
-      identifier: Map.get(issue_snapshot, "identifier"),
-      title: Map.get(issue_snapshot, "title"),
-      state: Map.get(issue_snapshot, "state"),
-      url: Map.get(issue_snapshot, "url"),
-      repo_id: Map.get(issue_snapshot, "repo_id"),
-      number: Map.get(issue_snapshot, "number"),
-      labels: Map.get(issue_snapshot, "labels") || [],
-      pr_url: Map.get(issue_snapshot, "pr_url"),
-      head_sha: Map.get(issue_snapshot, "head_sha"),
-      pr_state: Map.get(issue_snapshot, "pr_state"),
-      check_state: Map.get(issue_snapshot, "check_state"),
-      review_state: Map.get(issue_snapshot, "review_state")
-    }
-  end
-
-  defp snapshot_issue_id(%{"repo_id" => repo_id, "number" => number}) when is_binary(repo_id) and is_integer(number) do
-    "#{repo_id}##{number}"
-  end
-
-  defp snapshot_issue_id(%{"identifier" => identifier}) when is_binary(identifier), do: identifier
-  defp snapshot_issue_id(_issue_snapshot), do: "unknown"
 
   defp running_entry_payload(entry) do
     %{

@@ -70,6 +70,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
     {:noreply, reload_with_notice(socket, notice)}
   end
 
+  def handle_event("merge-issue-pr", %{"repo-id" => repo_id, "number" => number}, socket) do
+    notice =
+      case Orchestrator.merge_issue_pr(repo_id, number, orchestrator()) do
+        {:ok, _payload} -> "Merge requested for #{repo_id}##{number}"
+        {:error, {:merge_gate_blocked, reasons}} -> "Merge blocked for #{repo_id}##{number}: #{Enum.join(reasons, ", ")}"
+        {:error, reason} -> "Merge failed for #{repo_id}##{number}: #{inspect(reason)}"
+      end
+
+    {:noreply, reload_with_notice(socket, notice)}
+  end
+
   def handle_event("stop-session", %{"repo-id" => repo_id, "number" => number}, socket) do
     notice =
       case Orchestrator.stop_issue_session(repo_id, number, orchestrator()) do
@@ -327,6 +338,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <%= if merge_gate_review_label(issue["merge_gate"]) do %>
                           <span class="meta-pill"><%= merge_gate_review_label(issue["merge_gate"]) %></span>
                         <% end %>
+                        <button
+                          type="button"
+                          class={merge_gate_button_class(issue["merge_gate"])}
+                          phx-click="merge-issue-pr"
+                          phx-value-repo-id={issue["repo_id"]}
+                          phx-value-number={issue["number"]}
+                          disabled={merge_gate_blocked?(issue["merge_gate"])}
+                          title={merge_gate_title(issue["merge_gate"])}
+                        >
+                          Merge
+                        </button>
                       <% end %>
                     </div>
                     <%= if present?(issue["pr_url"]) && merge_gate_blocked?(issue["merge_gate"]) do %>
@@ -670,6 +692,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp merge_gate_badge_class(%{"ready" => true}), do: "meta-pill merge-gate-ready"
   defp merge_gate_badge_class(_gate), do: "meta-pill merge-gate-blocked"
+
+  defp merge_gate_button_class(%{"ready" => true}), do: "subtle-button merge-action"
+  defp merge_gate_button_class(_gate), do: "subtle-button merge-action merge-action-disabled"
 
   defp merge_gate_label(%{"ready" => true}), do: "merge-ready"
   defp merge_gate_label(_gate), do: "merge-blocked"

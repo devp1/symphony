@@ -9,7 +9,9 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.AgentRunner
+  alias SymphonyElixir.AutonomousReview
   alias SymphonyElixir.Config
+  alias SymphonyElixir.GitHub
   alias SymphonyElixir.IssueSession
   alias SymphonyElixir.Linear.Issue
   alias SymphonyElixir.RunLedger
@@ -2936,6 +2938,20 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec merge_issue_pr(String.t(), String.t() | integer()) ::
+          {:ok, map()} | {:error, :issue_not_found | :unavailable | {:merge_gate_blocked, [String.t()]} | term()}
+  def merge_issue_pr(repo_id, number), do: merge_issue_pr(repo_id, number, __MODULE__)
+
+  @spec merge_issue_pr(String.t(), String.t() | integer(), GenServer.server()) ::
+          {:ok, map()} | {:error, :issue_not_found | :unavailable | {:merge_gate_blocked, [String.t()]} | term()}
+  def merge_issue_pr(repo_id, number, server) when is_binary(repo_id) do
+    if server_available?(server) do
+      GenServer.call(server, {:merge_issue_pr, repo_id, number})
+    else
+      {:error, :unavailable}
+    end
+  end
+
   @spec stop_issue_session(String.t(), String.t() | integer()) ::
           {:ok, map()} | {:error, :session_not_found | :unavailable}
   def stop_issue_session(repo_id, number), do: stop_issue_session(repo_id, number, __MODULE__)
@@ -3109,6 +3125,20 @@ defmodule SymphonyElixir.Orchestrator do
     {:reply, {:ok, %{repo_id: repo_id, number: number, queued: true, transition_result: transition_result}}, state}
   end
 
+  def handle_call({:merge_issue_pr, repo_id, number}, _from, state) do
+    reply =
+      case merge_issue_pr_now(repo_id, number) do
+        {:ok, payload} ->
+          notify_dashboard()
+          {:ok, payload}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+
+    {:reply, reply, state}
+  end
+
   def handle_call({:stop_issue_session, repo_id, number}, _from, state) do
     number = number |> to_string() |> String.to_integer()
 
@@ -3140,6 +3170,87 @@ defmodule SymphonyElixir.Orchestrator do
         {:reply, {:error, :session_not_found}, state}
     end
   end
+
+  defp merge_issue_pr_now(repo_id, number) do
+    with {:ok, number} <- issue_number(number),
+         {:ok, issue_snapshot} <- stored_issue_snapshot(repo_id, number),
+         issue = AutonomousReview.issue_from_snapshot(issue_snapshot),
+         latest_review = latest_autonomous_review_for_issue(repo_id, number),
+         gate = AutonomousReview.merge_gate(issue, latest_review),
+         :ok <- ensure_merge_gate_ready(gate),
+         {:ok, merge_response} <- GitHub.Client.merge_pull_request(issue) do
+      append_issue_event(issue, "info", "cockpit merge requested", %{
+        pr_url: issue.pr_url,
+        head_sha: issue.head_sha,
+        merge_gate_reasons: gate.reasons
+      })
+
+      {:ok,
+       %{
+         repo_id: repo_id,
+         number: number,
+         issue_identifier: issue.identifier,
+         pr_url: issue.pr_url,
+         head_sha: issue.head_sha,
+         merge_response: merge_response
+       }}
+    else
+      {:error, {:merge_gate_blocked, reasons}} = error ->
+        append_issue_event(repo_id, number, "warning", "cockpit merge blocked", %{reasons: reasons})
+        error
+
+      {:error, reason} = error ->
+        append_issue_event(repo_id, number, "error", "cockpit merge failed", %{reason: inspect(reason)})
+        error
+    end
+  end
+
+  defp ensure_merge_gate_ready(%{ready?: true}), do: :ok
+  defp ensure_merge_gate_ready(%{reasons: reasons}), do: {:error, {:merge_gate_blocked, reasons}}
+
+  defp stored_issue_snapshot(repo_id, number) do
+    case Enum.find(Storage.list_issues(), &stored_issue_snapshot_match?(&1, repo_id, number)) do
+      nil -> {:error, :issue_not_found}
+      issue_snapshot -> {:ok, issue_snapshot}
+    end
+  end
+
+  defp stored_issue_snapshot_match?(%{"repo_id" => repo_id, "number" => number}, repo_id, number), do: true
+  defp stored_issue_snapshot_match?(_issue_snapshot, _repo_id, _number), do: false
+
+  defp latest_autonomous_review_for_issue(repo_id, number) do
+    Enum.find(Storage.list_autonomous_reviews(250), fn review ->
+      Map.get(review, "repo_id") == repo_id and Map.get(review, "issue_number") == number
+    end)
+  end
+
+  defp append_issue_event(%Issue{repo_id: repo_id, number: number}, level, message, data) do
+    append_issue_event(repo_id, number, level, message, data)
+  end
+
+  defp append_issue_event(repo_id, number, level, message, data) do
+    case latest_run_for_issue(repo_id, number) do
+      %{"id" => run_id} -> Storage.append_event(run_id, level, message, data)
+      _run -> :ok
+    end
+  end
+
+  defp latest_run_for_issue(repo_id, number) do
+    Enum.find(Storage.list_runs(250), fn run ->
+      Map.get(run, "repo_id") == repo_id and Map.get(run, "issue_number") == number
+    end)
+  end
+
+  defp issue_number(number) when is_integer(number), do: {:ok, number}
+
+  defp issue_number(number) when is_binary(number) do
+    case Integer.parse(number) do
+      {parsed, ""} -> {:ok, parsed}
+      _ -> {:error, :invalid_issue_number}
+    end
+  end
+
+  defp issue_number(_number), do: {:error, :invalid_issue_number}
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)

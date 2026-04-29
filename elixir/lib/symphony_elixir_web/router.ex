@@ -34,6 +34,7 @@ defmodule SymphonyElixirWeb.Router do
     get("/api/v1/runs/:run_id", ObservabilityApiController, :run)
     post("/api/v1/runs/:run_id/cancel", ObservabilityApiController, :cancel_run)
     post("/api/v1/issues/:repo_id/:number/rerun", ObservabilityApiController, :rerun_issue)
+    post("/api/v1/issues/:repo_id/:number/merge", ObservabilityApiController, :merge_issue_pr)
     post("/api/v1/issues/:repo_id/:number/stop-session", ObservabilityApiController, :stop_issue_session)
 
     match(:*, "/", ObservabilityApiController, :method_not_allowed)

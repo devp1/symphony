@@ -86,6 +86,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:reply, response, state}
     end
 
+    def handle_call({:merge_issue_pr, repo_id, number}, _from, state) do
+      response = Keyword.get(state, :merge_response, {:ok, %{repo_id: repo_id, number: to_string(number), merged: true}})
+      {:reply, response, state}
+    end
+
     def handle_call({:stop_issue_session, repo_id, number}, _from, state) do
       response = Keyword.get(state, :stop_session_response, {:ok, %{repo_id: repo_id, number: to_string(number)}})
       {:reply, response, state}
@@ -498,6 +503,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert %{"ok" => true, "action" => "rerun_requested"} =
              json_response(post(build_conn(), "/api/v1/issues/beacon/10/rerun", %{}), 202)
 
+    assert %{"ok" => true, "action" => "merge_requested"} =
+             json_response(post(build_conn(), "/api/v1/issues/beacon/11/merge", %{}), 202)
+
     conn = get(build_conn(), "/api/v1/MT-HTTP")
     issue_payload = json_response(conn, 200)
 
@@ -557,6 +565,27 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "phoenix merge api returns gate-blocked reasons without treating it as unavailable" do
+    orchestrator_name = Module.concat(__MODULE__, :MergeBlockedOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        merge_response: {:error, {:merge_gate_blocked, ["ci-not-green", "autonomous-review-stale"]}}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    assert %{
+             "error" => %{
+               "code" => "merge_gate_blocked",
+               "message" => "Merge gate blocked",
+               "reasons" => ["ci-not-green", "autonomous-review-stale"]
+             }
+           } = json_response(post(build_conn(), "/api/v1/issues/beacon/11/merge", %{}), 409)
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -670,6 +699,37 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
+    :ok =
+      SymphonyElixir.Storage.record_issue_snapshot(%{
+        repo_id: "beacon",
+        number: 20,
+        identifier: "beacon-20",
+        title: "Ready merge",
+        state: "Human Review",
+        labels: ["symphony", "human-review"],
+        pr_url: "https://github.com/devp1/Beacon/pull/20",
+        head_sha: "merge-sha",
+        pr_state: "OPEN",
+        check_state: "passing",
+        review_state: "APPROVED"
+      })
+
+    assert {:ok, _review_id} =
+             SymphonyElixir.Storage.record_autonomous_review(%{
+               id: "live-review-ready",
+               repo_id: "beacon",
+               issue_number: 20,
+               issue_identifier: "beacon-20",
+               pr_url: "https://github.com/devp1/Beacon/pull/20",
+               head_sha: "merge-sha",
+               reviewer_kind: "review-agent",
+               verdict: "pass",
+               summary: "clean",
+               check_name: "symphony/autonomous-review",
+               check_conclusion: "success",
+               stale: false
+             })
+
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "GitHub Control Plane"
     assert html =~ "MT-HTTP"
@@ -687,6 +747,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Rerun"
     assert html =~ "Stop Session"
     assert html =~ "PR handoff"
+    assert html =~ "merge-ready"
+    assert html =~ "Merge"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     assert html =~ "Refresh now"
@@ -697,6 +759,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert render_click(view, "refresh") =~ "Refresh queued"
     assert render_click(view, "cancel-run", %{"run-id" => "run-http"}) =~ "Cancel requested"
     assert render_click(view, "rerun-issue", %{"repo-id" => "beacon", "number" => "10"}) =~ "Rerun queued"
+    assert render_click(view, "merge-issue-pr", %{"repo-id" => "beacon", "number" => "20"}) =~ "Merge requested"
     assert render_click(view, "stop-session", %{"repo-id" => "beacon", "number" => "10"}) =~ "Stop requested"
 
     updated_snapshot =

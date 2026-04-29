@@ -1770,6 +1770,15 @@ Minimum endpoints:
   - Requests a new active cycle for an eligible issue.
   - Implementations SHOULD preserve workspace, workpad, issue session, and PR context when safe.
 
+- `POST /api/v1/issues/:repo_id/:number/merge`
+  - Requests a human-triggered cockpit merge for the issue's associated pull request.
+  - Implementations MUST recompute merge eligibility server-side immediately before issuing any
+    GitHub merge request. UI disablement alone is not sufficient.
+  - If the gate is blocked, return `409` with a JSON error that includes the blocking reasons, such
+    as `ci-not-green`, `autonomous-review-not-passing`, or `autonomous-review-stale`.
+  - Local trusted GitHub implementations SHOULD use the builder GitHub identity for the merge and
+    SHOULD pin the merge request to the reconciled PR head SHA when available.
+
 - `POST /api/v1/issues/:repo_id/:number/stop-session`
   - Stops a running or parked durable issue session for local cleanup.
   - If the issue session is unknown, return `404`.
@@ -1779,7 +1788,7 @@ API design notes:
 - The JSON shapes above are the RECOMMENDED baseline for interoperability and debugging ergonomics.
 - Implementations MAY add fields, but SHOULD avoid breaking existing fields within a version.
 - Endpoints SHOULD be read-only except for explicit local operator controls such as `/refresh`,
-  `/cancel`, `/rerun`, and `/stop-session`.
+  `/cancel`, `/rerun`, `/merge`, and `/stop-session`.
 - Unsupported methods on defined routes SHOULD return `405 Method Not Allowed`.
 - API errors SHOULD use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.
 - If the dashboard is a client-side app, it SHOULD consume this API rather than duplicating state

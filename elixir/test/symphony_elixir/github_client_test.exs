@@ -535,6 +535,42 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert "event=APPROVE" in args
   end
 
+  test "merge_pull_request uses builder identity and pins the reviewed head sha" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_builder_token: "builder-token",
+      github_reviewer_token: "reviewer-token"
+    )
+
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :github_command_fun, fn args, env ->
+      send(parent, {:gh_args, args, env})
+      {Jason.encode!(%{"merged" => true, "sha" => "merge-sha"}), 0}
+    end)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
+
+    issue = %Issue{
+      id: "25",
+      identifier: "GH-25",
+      title: "Merge me",
+      repo_owner: "devp1",
+      repo_name: "Beacon",
+      pr_url: "https://github.com/devp1/Beacon/pull/25",
+      head_sha: "abc123"
+    }
+
+    assert {:ok, %{"merged" => true, "sha" => "merge-sha"}} = GitHubClient.merge_pull_request(issue)
+
+    assert_received {:gh_args, args, [{"GH_TOKEN", "builder-token"}, {"GITHUB_TOKEN", "builder-token"}]}
+    assert ["api", "repos/devp1/Beacon/pulls/25/merge" | _] = args
+    assert "merge_method=squash" in args
+    assert "sha=abc123" in args
+  end
+
   test "preflight fails when gh auth is unavailable" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",

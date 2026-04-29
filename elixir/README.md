@@ -283,8 +283,8 @@ codex:
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/repos`, `/api/v1/issues`, `/api/v1/runs/:id`,
   `/api/v1/runs/:run_id/cancel`, `/api/v1/issues/:repo_id/:number/rerun`,
-  `/api/v1/issues/:repo_id/:number/stop-session`, `/api/v1/<issue_identifier>`, and
-  `/api/v1/refresh`.
+  `/api/v1/issues/:repo_id/:number/merge`, `/api/v1/issues/:repo_id/:number/stop-session`,
+  `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 
 ## Web dashboard
 
@@ -296,9 +296,13 @@ The cockpit UI runs on a minimal Phoenix stack:
 - Phoenix dependency static assets for the LiveView client bootstrap
 
 The cockpit surfaces GitHub PR handoff metadata when available: PR URL, head SHA, check state, and
-review state. Active run rows include operator controls to request cancellation, rerun an issue, or
-stop a parked/running durable issue session. Those controls call the same JSON API used by tests;
-they are local trusted control-plane actions, not part of the worker prompt.
+review state. PR-backed issue cards include a local trusted `Merge` action only when the server-side
+merge gate is clear: open PR, green CI, passing autonomous review, and non-stale review head SHA.
+Blocked cards show the exact disabled reasons, and the merge endpoint recomputes the same gate
+before issuing any GitHub merge request. Active run rows include operator controls to request
+cancellation, rerun an issue, or stop a parked/running durable issue session. Those controls call
+the same JSON API used by tests; they are local trusted control-plane actions, not part of the worker
+prompt.
 Parked durable sessions are shown separately from active runs so `human-review` parking does not look
 like a failing or still-running worker.
 

@@ -840,8 +840,7 @@ defmodule SymphonyElixir.IssueSession do
     %{issue | pr_url: pr_url, pr_number: issue.pr_number || pr_number_from_url(pr_url)}
   end
 
-  defp handoff_pr_url(handoff) when is_map(handoff), do: Map.get(handoff, :pr_url)
-  defp handoff_pr_url(_handoff), do: nil
+  defp handoff_pr_url(handoff), do: Map.get(handoff, :pr_url)
 
   defp reviewable_pr?(%Issue{pr_url: pr_url, pr_number: pr_number}) do
     (is_binary(pr_url) and String.trim(pr_url) != "") or not is_nil(pr_number)
@@ -989,7 +988,6 @@ defmodule SymphonyElixir.IssueSession do
 
   defp run_handoff_stage(%__MODULE__{} = state, health_flag, status_message, event_message, metadata, fun)
        when is_binary(health_flag) and is_binary(status_message) and is_binary(event_message) and is_function(fun, 0) do
-    metadata = metadata || %{}
     payload = Map.merge(%{issue_session_id: state.issue_session_id, health: [health_flag]}, metadata)
 
     _ = Storage.append_event(state.run_id, "info", event_message, payload)

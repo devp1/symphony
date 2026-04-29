@@ -88,6 +88,33 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec merge_issue_pr(Conn.t(), map()) :: Conn.t()
+  def merge_issue_pr(conn, %{"repo_id" => repo_id, "number" => number}) do
+    case Orchestrator.merge_issue_pr(repo_id, number, orchestrator()) do
+      {:ok, payload} ->
+        conn
+        |> put_status(202)
+        |> json(payload |> Map.put(:ok, true) |> Map.put(:action, "merge_requested"))
+
+      {:error, :issue_not_found} ->
+        error_response(conn, 404, "issue_not_found", "Issue not found")
+
+      {:error, :invalid_issue_number} ->
+        error_response(conn, 400, "invalid_issue_number", "Invalid issue number")
+
+      {:error, {:merge_gate_blocked, reasons}} ->
+        conn
+        |> put_status(409)
+        |> json(%{error: %{code: "merge_gate_blocked", message: "Merge gate blocked", reasons: reasons}})
+
+      {:error, :unavailable} ->
+        error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+
+      {:error, reason} ->
+        error_response(conn, 502, "merge_failed", "Merge failed: #{inspect(reason)}")
+    end
+  end
+
   @spec stop_issue_session(Conn.t(), map()) :: Conn.t()
   def stop_issue_session(conn, %{"repo_id" => repo_id, "number" => number}) do
     case Orchestrator.stop_issue_session(repo_id, number, orchestrator()) do

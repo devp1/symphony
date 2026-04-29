@@ -190,6 +190,27 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  @spec merge_pull_request(Issue.t()) :: {:ok, map()} | {:error, term()}
+  def merge_pull_request(%Issue{} = issue) do
+    repo_config = repo_config_for_issue(issue)
+
+    with {:ok, pr_number} <- pull_request_number(issue) do
+      gh_api(
+        repo_config,
+        [
+          "repos/#{repo_config.owner}/#{repo_config.name}/pulls/#{pr_number}/merge",
+          "-X",
+          "PUT",
+          "-H",
+          "Accept: application/vnd.github+json",
+          "-f",
+          "merge_method=squash"
+        ] ++ merge_head_sha_args(issue),
+        :builder
+      )
+    end
+  end
+
   @doc false
   @spec command_env_for_test(github_role()) :: [{String.t(), String.t()}]
   def command_env_for_test(role) do
@@ -718,6 +739,12 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp ensure_review_approval_allowed(_event), do: :ok
+
+  defp merge_head_sha_args(%Issue{head_sha: head_sha}) when is_binary(head_sha) and head_sha != "" do
+    ["-f", "sha=#{head_sha}"]
+  end
+
+  defp merge_head_sha_args(_issue), do: []
 
   defp pull_request_number(%Issue{pr_number: number}) when is_integer(number), do: {:ok, number}
   defp pull_request_number(%Issue{pr_number: number}) when is_binary(number), do: {:ok, number}

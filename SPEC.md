@@ -647,6 +647,13 @@ not require recognizing or validating extension fields unless that extension is 
   owns issue labels/comments, branch updates, PR creation, and normal worker handoff
 - `github.reviewer_token`: optional string or `$VAR`; token for the independent GitHub reviewer
   identity that owns autonomous review check runs, PR review comments, and approvals
+- `github.builder_app`: optional GitHub App credential block. When present, it takes precedence
+  over `github.builder_token` for Symphony-owned GitHub writes. Fields: `app_id`,
+  `installation_id`, and either `private_key_path` or `private_key`.
+- `github.reviewer_app`: optional GitHub App credential block. When present, it takes precedence
+  over `github.reviewer_token` for autonomous review check runs, PR review comments, and
+  approvals. It must identify a different App installation than the builder identity for a passing
+  autonomous review.
 - `github.review_check_name`: string, default `symphony/autonomous-review`
 - `github.required_check_names`: list of strings, default `[]`; named CI checks the cockpit merge
   gate may require in addition to the autonomous review check

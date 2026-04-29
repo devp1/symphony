@@ -171,6 +171,30 @@ defmodule SymphonyElixir.CoreTest do
 
     refute Config.independent_github_reviewer?()
 
+    write_workflow_file!(Workflow.workflow_file_path(),
+      github_builder_app: %{app_id: "100", installation_id: "200", private_key_path: "/tmp/builder.pem"},
+      github_reviewer_app: %{app_id: "101", installation_id: "201", private_key_path: "/tmp/reviewer.pem"}
+    )
+
+    assert Config.settings!().github.builder_app.app_id == "100"
+    assert Config.settings!().github.reviewer_app.installation_id == "201"
+    assert {:app, %{app_id: "101", installation_id: "201"}} = Config.github_auth(:reviewer)
+    assert Config.independent_github_reviewer?()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      github_builder_app: %{app_id: "100", installation_id: "200", private_key_path: "/tmp/builder.pem"},
+      github_reviewer_app: %{app_id: "100", installation_id: "200", private_key_path: "/tmp/reviewer.pem"}
+    )
+
+    refute Config.independent_github_reviewer?()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      github_builder_app: %{app_id: "100", installation_id: "200"}
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "github.builder_app.private_key_path"
+
     write_workflow_file!(Workflow.workflow_file_path(), runtime_profile: "too_trusting")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "runtime_profile"

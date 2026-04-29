@@ -105,6 +105,8 @@ defmodule SymphonyElixir.TestSupport do
           tracker_assignee: nil,
           github_builder_token: nil,
           github_reviewer_token: nil,
+          github_builder_app: nil,
+          github_reviewer_app: nil,
           github_review_check_name: "symphony/autonomous-review",
           github_required_check_names: [],
           repos: nil,
@@ -162,6 +164,8 @@ defmodule SymphonyElixir.TestSupport do
     tracker_assignee = Keyword.get(config, :tracker_assignee)
     github_builder_token = Keyword.get(config, :github_builder_token)
     github_reviewer_token = Keyword.get(config, :github_reviewer_token)
+    github_builder_app = Keyword.get(config, :github_builder_app)
+    github_reviewer_app = Keyword.get(config, :github_reviewer_app)
     github_review_check_name = Keyword.get(config, :github_review_check_name)
     github_required_check_names = Keyword.get(config, :github_required_check_names)
     repos = Keyword.get(config, :repos)
@@ -220,7 +224,14 @@ defmodule SymphonyElixir.TestSupport do
         "  assignee: #{yaml_value(tracker_assignee)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
-        github_yaml(github_builder_token, github_reviewer_token, github_review_check_name, github_required_check_names),
+        github_yaml(
+          github_builder_token,
+          github_reviewer_token,
+          github_builder_app,
+          github_reviewer_app,
+          github_review_check_name,
+          github_required_check_names
+        ),
         repos_yaml(repos),
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
@@ -282,13 +293,29 @@ defmodule SymphonyElixir.TestSupport do
     Enum.join(["repos:" | repo_lines], "\n")
   end
 
-  defp github_yaml(builder_token, reviewer_token, review_check_name, required_check_names) do
+  defp github_yaml(builder_token, reviewer_token, builder_app, reviewer_app, review_check_name, required_check_names) do
     [
       "github:",
       "  builder_token: #{yaml_value(builder_token)}",
       "  reviewer_token: #{yaml_value(reviewer_token)}",
+      github_app_yaml("builder_app", builder_app),
+      github_app_yaml("reviewer_app", reviewer_app),
       "  review_check_name: #{yaml_value(review_check_name)}",
       "  required_check_names: #{yaml_value(required_check_names)}"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp github_app_yaml(_name, nil), do: nil
+
+  defp github_app_yaml(name, app) when is_map(app) do
+    [
+      "  #{name}:",
+      "    app_id: #{yaml_value(Map.get(app, :app_id) || Map.get(app, "app_id"))}",
+      "    installation_id: #{yaml_value(Map.get(app, :installation_id) || Map.get(app, "installation_id"))}",
+      "    private_key: #{yaml_value(Map.get(app, :private_key) || Map.get(app, "private_key"))}",
+      "    private_key_path: #{yaml_value(Map.get(app, :private_key_path) || Map.get(app, "private_key_path"))}"
     ]
     |> Enum.join("\n")
   end

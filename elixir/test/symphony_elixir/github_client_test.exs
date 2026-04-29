@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.GitHubClientTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.GitHub.AppAuth
   alias SymphonyElixir.GitHub.Client, as: GitHubClient
 
   test "normalizes GitHub issue labels into Symphony states" do
@@ -391,6 +392,62 @@ defmodule SymphonyElixir.GitHubClientTest do
              GitHubClient.command_env_for_test(:reviewer)
   end
 
+  test "github command environment mints installation tokens for configured apps" do
+    AppAuth.clear_cache_for_test()
+    key_dir = Path.join(System.tmp_dir!(), "symphony-elixir-github-app-key-#{System.unique_integer([:positive])}")
+    private_key_path = Path.join(key_dir, "app.pem")
+    File.mkdir_p!(key_dir)
+    File.write!(private_key_path, test_private_key_pem())
+    parent = self()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_builder_app: %{
+        app_id: "100",
+        installation_id: "200",
+        private_key_path: private_key_path
+      },
+      github_reviewer_app: %{
+        app_id: "101",
+        installation_id: "201",
+        private_key_path: private_key_path
+      }
+    )
+
+    Application.put_env(:symphony_elixir, :github_command_fun, fn args, env ->
+      send(parent, {:mint_args, args, env})
+
+      case args do
+        ["api", "app/installations/200/access_tokens" | _] ->
+          {Jason.encode!(%{"token" => "builder-installation-token", "expires_at" => "2099-01-01T00:00:00Z"}), 0}
+
+        ["api", "app/installations/201/access_tokens" | _] ->
+          {Jason.encode!(%{"token" => "reviewer-installation-token", "expires_at" => "2099-01-01T00:00:00Z"}), 0}
+      end
+    end)
+
+    on_exit(fn ->
+      AppAuth.clear_cache_for_test()
+      Application.delete_env(:symphony_elixir, :github_command_fun)
+      File.rm_rf(key_dir)
+    end)
+
+    assert Config.independent_github_reviewer?()
+
+    assert [{"GH_TOKEN", "builder-installation-token"}, {"GITHUB_TOKEN", "builder-installation-token"}] =
+             GitHubClient.command_env_for_test(:builder)
+
+    assert [{"GH_TOKEN", "reviewer-installation-token"}, {"GITHUB_TOKEN", "reviewer-installation-token"}] =
+             GitHubClient.command_env_for_test(:reviewer)
+
+    assert_receive {:mint_args, ["api", "app/installations/200/access_tokens" | _], [{"GH_TOKEN", builder_jwt}, {"GITHUB_TOKEN", builder_jwt}]}
+    assert_receive {:mint_args, ["api", "app/installations/201/access_tokens" | _], [{"GH_TOKEN", reviewer_jwt}, {"GITHUB_TOKEN", reviewer_jwt}]}
+    assert builder_jwt =~ "."
+    assert reviewer_jwt =~ "."
+  end
+
   test "autonomous review check is written with reviewer identity" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",
@@ -562,5 +619,12 @@ defmodule SymphonyElixir.GitHubClientTest do
                        "DELETE",
                        "--silent"
                      ]}
+  end
+
+  defp test_private_key_pem do
+    {:rsa, 1024, 65_537}
+    |> :public_key.generate_key()
+    |> then(&:public_key.pem_entry_encode(:RSAPrivateKey, &1))
+    |> then(&:public_key.pem_encode([&1]))
   end
 end

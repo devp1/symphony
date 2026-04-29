@@ -5,6 +5,7 @@ defmodule SymphonyElixir.GitHub.Client do
 
   alias SymphonyElixir.{Config, Linear.Issue, Storage}
   alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.GitHub.AppAuth
 
   @type github_role :: Config.github_role()
 
@@ -191,7 +192,12 @@ defmodule SymphonyElixir.GitHub.Client do
 
   @doc false
   @spec command_env_for_test(github_role()) :: [{String.t(), String.t()}]
-  def command_env_for_test(role), do: command_env(role)
+  def command_env_for_test(role) do
+    case command_env(role) do
+      {:ok, env} -> env
+      {:error, reason} -> raise ArgumentError, message: "GitHub command env failed: #{inspect(reason)}"
+    end
+  end
 
   @doc false
   @spec normalize_issue_for_test(map()) :: Issue.t() | nil
@@ -552,8 +558,9 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp gh_auth_preflight do
     case run_command(["auth", "status", "-h", "github.com"], :builder) do
-      {_output, 0} -> :ok
-      {output, status} -> {:error, {:github_auth_preflight_failed, status, String.trim(output)}}
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {output, status}} -> {:error, {:github_auth_preflight_failed, status, String.trim(output)}}
+      {:error, reason} -> {:error, {:github_auth_preflight_failed, :auth_config, inspect(reason)}}
     end
   end
 
@@ -594,8 +601,9 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp gh_json(_repo_config, args, role \\ :builder) when is_list(args) do
     case run_command(args, role) do
-      {output, 0} -> Jason.decode(output)
-      {output, status} -> {:error, {:gh_api_failed, status, String.trim(output)}}
+      {:ok, {output, 0}} -> Jason.decode(output)
+      {:ok, {output, status}} -> {:error, {:gh_api_failed, status, String.trim(output)}}
+      {:error, reason} -> {:error, reason}
     end
   rescue
     error -> {:error, {:gh_command_failed, Exception.message(error)}}
@@ -610,25 +618,38 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp run_command(args, role) do
-    command = command_fun()
-    env = command_env(role)
+    with {:ok, env} <- command_env(role) do
+      command = command_fun()
 
-    cond do
-      is_function(command, 2) ->
-        command.(args, env)
+      result =
+        cond do
+          is_function(command, 2) ->
+            command.(args, env)
 
-      is_function(command, 1) ->
-        command.(args)
+          is_function(command, 1) ->
+            command.(args)
 
-      true ->
-        System.cmd("gh", args, stderr_to_stdout: true, env: env)
+          true ->
+            System.cmd("gh", args, stderr_to_stdout: true, env: env)
+        end
+
+      {:ok, result}
     end
   end
 
   defp command_env(role) when role in [:builder, :reviewer] do
-    case Config.github_token(role) do
-      token when is_binary(token) and token != "" -> [{"GH_TOKEN", token}, {"GITHUB_TOKEN", token}]
-      _ -> []
+    case Config.github_auth(role) do
+      {:app, app_config} ->
+        case AppAuth.installation_token(app_config, command_fun()) do
+          {:ok, token} -> {:ok, [{"GH_TOKEN", token}, {"GITHUB_TOKEN", token}]}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:token, token} ->
+        {:ok, [{"GH_TOKEN", token}, {"GITHUB_TOKEN", token}]}
+
+      nil ->
+        {:ok, []}
     end
   end
 

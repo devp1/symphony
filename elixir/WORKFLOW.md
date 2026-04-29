@@ -14,6 +14,15 @@ tracker:
 github:
   builder_token: $SYMPHONY_GITHUB_BUILDER_TOKEN
   reviewer_token: $SYMPHONY_GITHUB_REVIEWER_TOKEN
+  # Prefer role-specific GitHub Apps for the full independent-review path.
+  # builder_app:
+  #   app_id: $SYMPHONY_GITHUB_BUILDER_APP_ID
+  #   installation_id: $SYMPHONY_GITHUB_BUILDER_INSTALLATION_ID
+  #   private_key_path: $SYMPHONY_GITHUB_BUILDER_PRIVATE_KEY_PATH
+  # reviewer_app:
+  #   app_id: $SYMPHONY_GITHUB_REVIEWER_APP_ID
+  #   installation_id: $SYMPHONY_GITHUB_REVIEWER_INSTALLATION_ID
+  #   private_key_path: $SYMPHONY_GITHUB_REVIEWER_PRIVATE_KEY_PATH
   review_check_name: symphony/autonomous-review
   required_check_names: []
 repos:

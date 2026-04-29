@@ -83,18 +83,58 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    defmodule App do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+      embedded_schema do
+        field(:app_id, :string)
+        field(:installation_id, :string)
+        field(:private_key, :string)
+        field(:private_key_path, :string)
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema
+        |> cast(attrs, [:app_id, :installation_id, :private_key, :private_key_path], empty_values: [])
+        |> validate_required([:app_id, :installation_id])
+        |> validate_private_key_source()
+      end
+
+      defp validate_private_key_source(changeset) do
+        private_key = get_field(changeset, :private_key)
+        private_key_path = get_field(changeset, :private_key_path)
+
+        if present?(private_key) or present?(private_key_path) do
+          changeset
+        else
+          add_error(changeset, :private_key_path, "or private_key must be provided")
+        end
+      end
+
+      defp present?(value) when is_binary(value), do: String.trim(value) != ""
+      defp present?(_value), do: false
+    end
+
     @primary_key false
     embedded_schema do
       field(:builder_token, :string)
       field(:reviewer_token, :string)
       field(:review_check_name, :string, default: "symphony/autonomous-review")
       field(:required_check_names, {:array, :string}, default: [])
+      embeds_one(:builder_app, App, on_replace: :update)
+      embeds_one(:reviewer_app, App, on_replace: :update)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
       |> cast(attrs, [:builder_token, :reviewer_token, :review_check_name, :required_check_names], empty_values: [])
+      |> cast_embed(:builder_app, with: &App.changeset/2)
+      |> cast_embed(:reviewer_app, with: &App.changeset/2)
       |> validate_required([:review_check_name])
       |> update_change(:required_check_names, &normalize_check_names/1)
     end
@@ -551,7 +591,9 @@ defmodule SymphonyElixir.Config.Schema do
           resolve_secret_setting(
             settings.github.reviewer_token,
             System.get_env("SYMPHONY_GITHUB_REVIEWER_TOKEN")
-          )
+          ),
+        builder_app: resolve_github_app(settings.github.builder_app, "SYMPHONY_GITHUB_BUILDER", "BUILDER_GITHUB"),
+        reviewer_app: resolve_github_app(settings.github.reviewer_app, "SYMPHONY_GITHUB_REVIEWER", "REVIEWER_GITHUB")
     }
 
     workspace = %{
@@ -627,6 +669,60 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_optional_map(nil), do: nil
   defp normalize_optional_map(value) when is_map(value), do: normalize_keys(value)
+
+  defp resolve_github_app(app, primary_prefix, fallback_prefix) do
+    app = app || github_app_from_env(primary_prefix, fallback_prefix)
+
+    case app do
+      nil ->
+        nil
+
+      %GitHub.App{} = app ->
+        %{
+          app
+          | app_id: resolve_secret_setting(app.app_id, first_present_env(["#{primary_prefix}_APP_ID", "#{fallback_prefix}_APP_ID"])),
+            installation_id:
+              resolve_secret_setting(
+                app.installation_id,
+                first_present_env(["#{primary_prefix}_INSTALLATION_ID", "#{fallback_prefix}_INSTALLATION_ID"])
+              ),
+            private_key: resolve_secret_setting(app.private_key, first_present_env(["#{primary_prefix}_PRIVATE_KEY", "#{fallback_prefix}_PRIVATE_KEY"])),
+            private_key_path:
+              resolve_secret_setting(
+                app.private_key_path,
+                first_present_env(["#{primary_prefix}_PRIVATE_KEY_PATH", "#{fallback_prefix}_PRIVATE_KEY_PATH"])
+              )
+        }
+    end
+  end
+
+  defp github_app_from_env(primary_prefix, fallback_prefix) do
+    app_id = first_present_env(["#{primary_prefix}_APP_ID", "#{fallback_prefix}_APP_ID"])
+    installation_id = first_present_env(["#{primary_prefix}_INSTALLATION_ID", "#{fallback_prefix}_INSTALLATION_ID"])
+    private_key = first_present_env(["#{primary_prefix}_PRIVATE_KEY", "#{fallback_prefix}_PRIVATE_KEY"])
+    private_key_path = first_present_env(["#{primary_prefix}_PRIVATE_KEY_PATH", "#{fallback_prefix}_PRIVATE_KEY_PATH"])
+
+    if Enum.any?([app_id, installation_id, private_key, private_key_path], &present?/1) do
+      %GitHub.App{
+        app_id: normalize_secret_value(app_id),
+        installation_id: normalize_secret_value(installation_id),
+        private_key: normalize_secret_value(private_key),
+        private_key_path: normalize_secret_value(private_key_path)
+      }
+    end
+  end
+
+  defp first_present_env(names) do
+    Enum.find_value(names, fn name ->
+      case System.get_env(name) do
+        value when is_binary(value) and value != "" -> value
+        _ -> nil
+      end
+    end)
+  end
+
+  defp present?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present?(_value), do: false
 
   defp normalize_key(value) when is_atom(value), do: Atom.to_string(value)
   defp normalize_key(value), do: to_string(value)

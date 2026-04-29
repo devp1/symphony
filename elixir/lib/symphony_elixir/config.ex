@@ -27,6 +27,7 @@ defmodule SymphonyElixir.Config do
         }
 
   @type github_role :: :builder | :reviewer
+  @type github_auth :: {:app, map()} | {:token, String.t()} | nil
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
@@ -82,13 +83,38 @@ defmodule SymphonyElixir.Config do
   def github_token(:builder), do: settings!().github.builder_token
   def github_token(:reviewer), do: settings!().github.reviewer_token
 
+  @spec github_app(github_role()) :: map() | nil
+  def github_app(:builder), do: settings!().github.builder_app
+  def github_app(:reviewer), do: settings!().github.reviewer_app
+
+  @spec github_auth(github_role()) :: github_auth()
+  def github_auth(role) when role in [:builder, :reviewer] do
+    case github_app(role) do
+      %{} = app when map_size(app) > 0 ->
+        {:app, app}
+
+      _ ->
+        case github_token(role) do
+          token when is_binary(token) and token != "" -> {:token, token}
+          _ -> nil
+        end
+    end
+  end
+
   @spec independent_github_reviewer?() :: boolean()
   def independent_github_reviewer? do
-    settings = settings!()
-    builder_token = settings.github.builder_token
-    reviewer_token = settings.github.reviewer_token
+    builder_identity = github_identity(:builder)
+    reviewer_identity = github_identity(:reviewer)
 
-    is_binary(reviewer_token) and String.trim(reviewer_token) != "" and reviewer_token != builder_token
+    not is_nil(reviewer_identity) and reviewer_identity != builder_identity
+  end
+
+  defp github_identity(role) do
+    case github_auth(role) do
+      {:app, %{app_id: app_id, installation_id: installation_id}} -> {:app, app_id, installation_id}
+      {:token, token} -> {:token, token}
+      nil -> nil
+    end
   end
 
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()

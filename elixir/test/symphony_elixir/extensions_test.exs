@@ -372,6 +372,37 @@ defmodule SymphonyElixir.ExtensionsTest do
         labels: ["symphony", "agent-ready"]
       })
 
+    :ok =
+      SymphonyElixir.Storage.record_issue_snapshot(%{
+        repo_id: "beacon",
+        number: 11,
+        identifier: "beacon-11",
+        title: "Review proof",
+        state: "Human Review",
+        labels: ["symphony", "human-review"],
+        pr_url: "https://github.com/devp1/Beacon/pull/11",
+        head_sha: "reviewed-sha",
+        pr_state: "OPEN",
+        check_state: "passing",
+        review_state: "APPROVED"
+      })
+
+    assert {:ok, _review_id} =
+             SymphonyElixir.Storage.record_autonomous_review(%{
+               id: "api-review-ready",
+               repo_id: "beacon",
+               issue_number: 11,
+               issue_identifier: "beacon-11",
+               pr_url: "https://github.com/devp1/Beacon/pull/11",
+               head_sha: "reviewed-sha",
+               reviewer_kind: "review-agent",
+               verdict: "pass",
+               summary: "clean",
+               check_name: "symphony/autonomous-review",
+               check_conclusion: "success",
+               stale: false
+             })
+
     {:ok, run_id} =
       SymphonyElixir.Storage.start_run(%{
         repo_id: "beacon",
@@ -418,11 +449,43 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
            ] = state_payload["retrying"]
 
-    assert Enum.any?(state_payload["issues"], &match?(%{"identifier" => "beacon-10", "labels" => ["symphony", "agent-ready"]}, &1))
+    assert Enum.any?(
+             state_payload["issues"],
+             &match?(%{"identifier" => "beacon-10", "labels" => ["symphony", "agent-ready"]}, &1)
+           )
+
+    assert Enum.any?(
+             state_payload["issues"],
+             &match?(
+               %{
+                 "identifier" => "beacon-11",
+                 "merge_gate" => %{
+                   "ready" => true,
+                   "reasons" => [],
+                   "review_verdict" => "pass",
+                   "review_stale" => false
+                 }
+               },
+               &1
+             )
+           )
+
     assert Enum.any?(state_payload["runs"], &match?(%{"id" => ^run_id, "state" => "running", "pr_url" => nil}, &1))
 
     assert %{"issues" => issues_payload} = json_response(get(build_conn(), "/api/v1/issues"), 200)
+
     assert Enum.any?(issues_payload, &match?(%{"identifier" => "beacon-10"}, &1))
+
+    assert Enum.any?(
+             issues_payload,
+             &match?(
+               %{
+                 "identifier" => "beacon-11",
+                 "merge_gate" => %{"ready" => true, "latest_review_id" => "api-review-ready"}
+               },
+               &1
+             )
+           )
 
     assert %{"repos" => []} = json_response(get(build_conn(), "/api/v1/repos"), 200)
 

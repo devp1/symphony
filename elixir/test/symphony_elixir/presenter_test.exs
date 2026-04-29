@@ -51,6 +51,132 @@ defmodule SymphonyElixir.PresenterTest do
     assert payload.running.session_state == :parked
   end
 
+  test "issues payload includes explicit merge gate state from latest autonomous review" do
+    :ok =
+      SymphonyElixir.Storage.record_issue_snapshot(%{
+        repo_id: "beacon",
+        number: 25,
+        identifier: "GH-25",
+        title: "Ready PR",
+        state: "Human Review",
+        labels: ["symphony", "human-review"],
+        pr_url: "https://github.com/devp1/Beacon/pull/25",
+        head_sha: "abc123",
+        pr_state: "OPEN",
+        check_state: "passing",
+        review_state: "APPROVED"
+      })
+
+    :ok =
+      SymphonyElixir.Storage.record_issue_snapshot(%{
+        repo_id: "beacon",
+        number: 26,
+        identifier: "GH-26",
+        title: "Stale review",
+        state: "Human Review",
+        labels: ["symphony", "human-review"],
+        pr_url: "https://github.com/devp1/Beacon/pull/26",
+        head_sha: "new-sha",
+        pr_state: "OPEN",
+        check_state: "passing",
+        review_state: "APPROVED"
+      })
+
+    :ok =
+      SymphonyElixir.Storage.record_issue_snapshot(%{
+        repo_id: "beacon",
+        number: 27,
+        identifier: "GH-27",
+        title: "Failing CI",
+        state: "Human Review",
+        labels: ["symphony", "human-review"],
+        pr_url: "https://github.com/devp1/Beacon/pull/27",
+        head_sha: "def456",
+        pr_state: "OPEN",
+        check_state: "failing",
+        review_state: "APPROVED"
+      })
+
+    assert {:ok, _} =
+             SymphonyElixir.Storage.record_autonomous_review(%{
+               id: "review-ready",
+               repo_id: "beacon",
+               issue_number: 25,
+               issue_identifier: "GH-25",
+               pr_url: "https://github.com/devp1/Beacon/pull/25",
+               head_sha: "abc123",
+               reviewer_kind: "review-agent",
+               verdict: "pass",
+               summary: "clean",
+               check_name: "symphony/autonomous-review",
+               check_conclusion: "success",
+               stale: false
+             })
+
+    assert {:ok, _} =
+             SymphonyElixir.Storage.record_autonomous_review(%{
+               id: "review-stale",
+               repo_id: "beacon",
+               issue_number: 26,
+               issue_identifier: "GH-26",
+               pr_url: "https://github.com/devp1/Beacon/pull/26",
+               head_sha: "old-sha",
+               reviewer_kind: "review-agent",
+               verdict: "pass",
+               summary: "clean before force-push",
+               check_name: "symphony/autonomous-review",
+               check_conclusion: "success",
+               stale: true
+             })
+
+    assert {:ok, _} =
+             SymphonyElixir.Storage.record_autonomous_review(%{
+               id: "review-failing-ci",
+               repo_id: "beacon",
+               issue_number: 27,
+               issue_identifier: "GH-27",
+               pr_url: "https://github.com/devp1/Beacon/pull/27",
+               head_sha: "def456",
+               reviewer_kind: "review-agent",
+               verdict: "pass",
+               summary: "review clean",
+               check_name: "symphony/autonomous-review",
+               check_conclusion: "success",
+               stale: false
+             })
+
+    issues_by_identifier =
+      Presenter.issues_payload()
+      |> Map.new(&{&1["identifier"], &1})
+
+    assert %{
+             "ready" => true,
+             "reasons" => [],
+             "review_verdict" => "pass",
+             "review_stale" => false,
+             "latest_review_id" => "review-ready"
+           } = issues_by_identifier["GH-25"]["merge_gate"]
+
+    assert %{
+             "ready" => false,
+             "reasons" => stale_reasons,
+             "review_verdict" => "pass",
+             "review_stale" => true,
+             "latest_review_head_sha" => "old-sha"
+           } = issues_by_identifier["GH-26"]["merge_gate"]
+
+    assert "autonomous-review-stale" in stale_reasons
+
+    assert %{
+             "ready" => false,
+             "reasons" => failing_reasons,
+             "review_verdict" => "pass",
+             "review_stale" => false
+           } = issues_by_identifier["GH-27"]["merge_gate"]
+
+    assert "ci-not-green" in failing_reasons
+  end
+
   defp running_entry(issue_id, identifier, session_state) do
     now = DateTime.utc_now()
 

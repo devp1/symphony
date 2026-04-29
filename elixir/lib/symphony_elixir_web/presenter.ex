@@ -3,7 +3,8 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, Storage}
+  alias SymphonyElixir.{AutonomousReview, Config, Orchestrator, StatusDashboard, Storage}
+  alias SymphonyElixir.Linear.Issue
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -13,6 +14,7 @@ defmodule SymphonyElixirWeb.Presenter do
       %{} = snapshot ->
         active_running = Enum.reject(snapshot.running, &parked_entry?/1)
         parked = Enum.filter(snapshot.running, &parked_entry?/1)
+        autonomous_reviews = Storage.list_autonomous_reviews(100)
 
         %{
           generated_at: generated_at,
@@ -26,10 +28,10 @@ defmodule SymphonyElixirWeb.Presenter do
           issue_sessions: Storage.list_issue_sessions(),
           evidence_bundles: Storage.list_evidence_bundles(50),
           evidence_reviews: Storage.list_evidence_reviews(100),
-          autonomous_reviews: Storage.list_autonomous_reviews(100),
+          autonomous_reviews: autonomous_reviews,
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           repos: repos_payload(),
-          issues: Storage.list_issues(),
+          issues: issues_payload(autonomous_reviews),
           runs: Storage.list_runs(50),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
@@ -89,7 +91,14 @@ defmodule SymphonyElixirWeb.Presenter do
 
   @spec issues_payload() :: [map()]
   def issues_payload do
+    issues_payload(Storage.list_autonomous_reviews(100))
+  end
+
+  defp issues_payload(autonomous_reviews) when is_list(autonomous_reviews) do
+    latest_reviews = latest_autonomous_reviews_by_issue(autonomous_reviews)
+
     Storage.list_issues()
+    |> Enum.map(&put_merge_gate(&1, latest_reviews))
   end
 
   @spec run_payload(String.t()) :: {:ok, map()} | {:error, :run_not_found}
@@ -138,6 +147,60 @@ defmodule SymphonyElixirWeb.Presenter do
   defp issue_status(_running, _retry), do: "running"
 
   defp parked_entry?(entry), do: Map.get(entry, :session_state) in [:parked, "parked"]
+
+  defp latest_autonomous_reviews_by_issue(autonomous_reviews) do
+    Enum.reduce(autonomous_reviews, %{}, fn review, acc ->
+      case {Map.get(review, "repo_id"), Map.get(review, "issue_number")} do
+        {repo_id, issue_number} when is_binary(repo_id) and is_integer(issue_number) ->
+          Map.put_new(acc, {repo_id, issue_number}, review)
+
+        _ ->
+          acc
+      end
+    end)
+  end
+
+  defp put_merge_gate(%{} = issue_snapshot, latest_reviews) do
+    review = Map.get(latest_reviews, {Map.get(issue_snapshot, "repo_id"), Map.get(issue_snapshot, "number")})
+    gate = AutonomousReview.merge_gate(issue_from_snapshot(issue_snapshot), review)
+
+    Map.put(issue_snapshot, "merge_gate", %{
+      "ready" => gate.ready?,
+      "reasons" => gate.reasons,
+      "review_verdict" => gate.review_verdict,
+      "review_stale" => gate.review_stale?,
+      "latest_review_id" => review && Map.get(review, "id"),
+      "latest_review_head_sha" => review && Map.get(review, "head_sha"),
+      "check_state" => Map.get(issue_snapshot, "check_state"),
+      "pr_state" => Map.get(issue_snapshot, "pr_state"),
+      "review_state" => Map.get(issue_snapshot, "review_state")
+    })
+  end
+
+  defp issue_from_snapshot(%{} = issue_snapshot) do
+    %Issue{
+      id: snapshot_issue_id(issue_snapshot),
+      identifier: Map.get(issue_snapshot, "identifier"),
+      title: Map.get(issue_snapshot, "title"),
+      state: Map.get(issue_snapshot, "state"),
+      url: Map.get(issue_snapshot, "url"),
+      repo_id: Map.get(issue_snapshot, "repo_id"),
+      number: Map.get(issue_snapshot, "number"),
+      labels: Map.get(issue_snapshot, "labels") || [],
+      pr_url: Map.get(issue_snapshot, "pr_url"),
+      head_sha: Map.get(issue_snapshot, "head_sha"),
+      pr_state: Map.get(issue_snapshot, "pr_state"),
+      check_state: Map.get(issue_snapshot, "check_state"),
+      review_state: Map.get(issue_snapshot, "review_state")
+    }
+  end
+
+  defp snapshot_issue_id(%{"repo_id" => repo_id, "number" => number}) when is_binary(repo_id) and is_integer(number) do
+    "#{repo_id}##{number}"
+  end
+
+  defp snapshot_issue_id(%{"identifier" => identifier}) when is_binary(identifier), do: identifier
+  defp snapshot_issue_id(_issue_snapshot), do: "unknown"
 
   defp running_entry_payload(entry) do
     %{

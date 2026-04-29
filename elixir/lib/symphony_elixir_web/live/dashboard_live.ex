@@ -320,7 +320,20 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <%= if present?(issue["review_state"]) do %>
                         <span class="meta-pill"><%= issue["review_state"] %></span>
                       <% end %>
+                      <%= if present?(issue["pr_url"]) do %>
+                        <span class={merge_gate_badge_class(issue["merge_gate"])} title={merge_gate_title(issue["merge_gate"])}>
+                          <%= merge_gate_label(issue["merge_gate"]) %>
+                        </span>
+                        <%= if merge_gate_review_label(issue["merge_gate"]) do %>
+                          <span class="meta-pill"><%= merge_gate_review_label(issue["merge_gate"]) %></span>
+                        <% end %>
+                      <% end %>
                     </div>
+                    <%= if present?(issue["pr_url"]) && merge_gate_blocked?(issue["merge_gate"]) do %>
+                      <p class="merge-reasons">
+                        Disabled: <%= merge_gate_reasons(issue["merge_gate"]) %>
+                      </p>
+                    <% end %>
                   </article>
                 </div>
               </article>
@@ -654,6 +667,40 @@ defmodule SymphonyElixirWeb.DashboardLive do
       true -> base
     end
   end
+
+  defp merge_gate_badge_class(%{"ready" => true}), do: "meta-pill merge-gate-ready"
+  defp merge_gate_badge_class(_gate), do: "meta-pill merge-gate-blocked"
+
+  defp merge_gate_label(%{"ready" => true}), do: "merge-ready"
+  defp merge_gate_label(_gate), do: "merge-blocked"
+
+  defp merge_gate_title(gate) do
+    case merge_gate_reasons(gate) do
+      "none" -> "Merge gate is clear."
+      reasons -> "Merge disabled: #{reasons}"
+    end
+  end
+
+  defp merge_gate_blocked?(%{"ready" => true}), do: false
+  defp merge_gate_blocked?(%{"reasons" => reasons}) when is_list(reasons), do: reasons != []
+  defp merge_gate_blocked?(_gate), do: false
+
+  defp merge_gate_reasons(%{"reasons" => reasons}) when is_list(reasons) and reasons != [] do
+    Enum.join(reasons, ", ")
+  end
+
+  defp merge_gate_reasons(_gate), do: "none"
+
+  defp merge_gate_review_label(%{"review_verdict" => verdict, "review_stale" => true}) when is_binary(verdict) and verdict != "" do
+    "autonomous: #{verdict} stale"
+  end
+
+  defp merge_gate_review_label(%{"review_verdict" => verdict}) when is_binary(verdict) and verdict != "" do
+    "autonomous: #{verdict}"
+  end
+
+  defp merge_gate_review_label(%{"review_stale" => true}), do: "autonomous: stale"
+  defp merge_gate_review_label(_gate), do: nil
 
   defp issue_columns do
     ["Todo", "In Progress", "Human Review", "Needs Input", "Blocked", "Rework", "Merging", "Done", "Backlog"]

@@ -1,0 +1,16 @@
+{
+  "name": "Symphony Builder",
+  "url": "https://github.com/openai/symphony",
+  "hook_attributes": {
+    "url": "http://127.0.0.1:4001/github/builder-app/webhook"
+  },
+  "redirect_url": "http://127.0.0.1:4001/github/builder-app/manifest",
+  "public": false,
+  "default_permissions": {
+    "contents": "write",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "write"
+  },
+  "default_events": []
+}

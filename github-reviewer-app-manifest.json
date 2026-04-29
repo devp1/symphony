@@ -1,0 +1,17 @@
+{
+  "name": "Symphony Reviewer",
+  "url": "https://github.com/openai/symphony",
+  "hook_attributes": {
+    "url": "http://127.0.0.1:4001/github/reviewer-app/webhook"
+  },
+  "redirect_url": "http://127.0.0.1:4001/github/reviewer-app/manifest",
+  "public": false,
+  "default_permissions": {
+    "checks": "write",
+    "contents": "read",
+    "metadata": "read",
+    "pull_requests": "write",
+    "statuses": "read"
+  },
+  "default_events": []
+}

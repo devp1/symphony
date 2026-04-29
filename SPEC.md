@@ -654,6 +654,10 @@ not require recognizing or validating extension fields unless that extension is 
   over `github.reviewer_token` for autonomous review check runs, PR review comments, and
   approvals. It must identify a different App installation than the builder identity for a passing
   autonomous review.
+  The canonical env names are `SYMPHONY_GITHUB_BUILDER_APP_ID`,
+  `SYMPHONY_GITHUB_BUILDER_INSTALLATION_ID`, `SYMPHONY_GITHUB_BUILDER_PRIVATE_KEY_PATH`, and the
+  matching `SYMPHONY_GITHUB_REVIEWER_*` names. Foundry-style `BUILDER_GITHUB_*` and
+  `REVIEWER_GITHUB_*` names are accepted as fallbacks.
 - `github.review_check_name`: string, default `symphony/autonomous-review`
 - `github.required_check_names`: list of strings, default `[]`; named CI checks the cockpit merge
   gate may require in addition to the autonomous review check

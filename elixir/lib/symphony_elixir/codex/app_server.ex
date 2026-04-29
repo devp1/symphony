@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @github_issue_state_labels ~w(agent-ready in-progress human-review needs-input blocked rework merging)
 
   @type session :: %{
           port: port(),
@@ -21,6 +22,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
+          resume_thread_id: String.t() | nil,
           workspace: Path.t(),
           worker_host: String.t() | nil
         }
@@ -45,16 +47,18 @@ defmodule SymphonyElixir.Codex.AppServer do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread_id, resume_metadata} <-
+             do_start_session(port, expanded_workspace, session_policies, Keyword.get(opts, :resume_thread_id)) do
         {:ok,
          %{
            port: port,
-           metadata: metadata,
+           metadata: Map.merge(metadata, resume_metadata),
            approval_policy: session_policies.approval_policy,
            auto_approve_requests: session_policies.approval_policy == "never",
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
+           resume_thread_id: Keyword.get(opts, :resume_thread_id),
            workspace: expanded_workspace,
            worker_host: worker_host
          }}
@@ -104,7 +108,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, thread_id) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -270,10 +274,61 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies) do
+  defp do_start_session(port, workspace, session_policies, resume_thread_id) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies)
+      :ok -> start_or_resume_thread(port, workspace, session_policies, resume_thread_id)
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp start_or_resume_thread(port, workspace, session_policies, resume_thread_id)
+       when is_binary(resume_thread_id) and resume_thread_id != "" do
+    case resume_thread(port, workspace, resume_thread_id) do
+      {:ok, thread_id} ->
+        {:ok, thread_id, %{resume_attempted: true, resume_succeeded: true, resume_failure_reason: nil}}
+
+      {:error, reason} ->
+        Logger.warning("Codex thread/resume failed; falling back to thread/start: #{inspect(reason)}")
+
+        case start_thread(port, workspace, session_policies) do
+          {:ok, thread_id} ->
+            {:ok, thread_id,
+             %{
+               resume_attempted: true,
+               resume_succeeded: false,
+               resume_failure_reason: inspect(reason)
+             }}
+
+          other ->
+            other
+        end
+    end
+  end
+
+  defp start_or_resume_thread(port, workspace, session_policies, _resume_thread_id) do
+    case start_thread(port, workspace, session_policies) do
+      {:ok, thread_id} ->
+        {:ok, thread_id, %{resume_attempted: false, resume_succeeded: false, resume_failure_reason: nil}}
+
+      other ->
+        other
+    end
+  end
+
+  defp resume_thread(port, workspace, thread_id) do
+    send_message(port, %{
+      "method" => "thread/resume",
+      "id" => @thread_start_id,
+      "params" => %{
+        "threadId" => thread_id,
+        "cwd" => workspace,
+        "dynamicTools" => DynamicTool.tool_specs()
+      }
+    })
+
+    case await_response(port, @thread_start_id) do
+      {:ok, result} -> extract_thread_id(result)
+      other -> other
     end
   end
 
@@ -285,21 +340,23 @@ defmodule SymphonyElixir.Codex.AppServer do
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
         "cwd" => workspace,
-        "dynamicTools" => DynamicTool.tool_specs()
+        "dynamicTools" => DynamicTool.tool_specs(),
+        "persistExtendedHistory" => true
       }
     })
 
     case await_response(port, @thread_start_id) do
-      {:ok, %{"thread" => thread_payload}} ->
-        case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
-        end
+      {:ok, result} ->
+        extract_thread_id(result)
 
       other ->
         other
     end
   end
+
+  defp extract_thread_id(%{"thread" => %{"id" => thread_id}}) when is_binary(thread_id), do: {:ok, thread_id}
+  defp extract_thread_id(%{"id" => thread_id}) when is_binary(thread_id), do: {:ok, thread_id}
+  defp extract_thread_id(payload), do: {:error, {:invalid_thread_payload, payload}}
 
   defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
     send_message(port, %{
@@ -326,72 +383,84 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, thread_id) do
     receive_loop(
       port,
       on_message,
-      Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      semantic_activity_state(thread_id)
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(port, on_message, pending_line, tool_executor, auto_approve_requests, activity) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, complete_line, tool_executor, auto_approve_requests, activity)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
           port,
           on_message,
-          timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          activity
         )
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
-      timeout_ms ->
-        {:error, :turn_timeout}
+      semantic_timeout_remaining_ms(activity) ->
+        {:error, {:semantic_inactivity_timeout, semantic_timeout_payload(activity)}}
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, data, tool_executor, auto_approve_requests, activity) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+        if foreign_thread_notification?(payload, activity.thread_id) do
+          receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+        else
+          emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+          {:ok, :turn_completed}
+        end
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
-        emit_turn_event(
-          on_message,
-          :turn_failed,
-          payload,
-          payload_string,
-          port,
-          Map.get(payload, "params")
-        )
+        if foreign_thread_notification?(payload, activity.thread_id) do
+          receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+        else
+          emit_turn_event(
+            on_message,
+            :turn_failed,
+            payload,
+            payload_string,
+            port,
+            Map.get(payload, "params")
+          )
 
-        {:error, {:turn_failed, Map.get(payload, "params")}}
+          {:error, {:turn_failed, Map.get(payload, "params")}}
+        end
 
       {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
-        emit_turn_event(
-          on_message,
-          :turn_cancelled,
-          payload,
-          payload_string,
-          port,
-          Map.get(payload, "params")
-        )
+        if foreign_thread_notification?(payload, activity.thread_id) do
+          receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+        else
+          emit_turn_event(
+            on_message,
+            :turn_cancelled,
+            payload,
+            payload_string,
+            port,
+            Map.get(payload, "params")
+          )
 
-        {:error, {:turn_cancelled, Map.get(payload, "params")}}
+          {:error, {:turn_cancelled, Map.get(payload, "params")}}
+        end
 
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
@@ -401,9 +470,9 @@ defmodule SymphonyElixir.Codex.AppServer do
           payload,
           payload_string,
           method,
-          timeout_ms,
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          activity
         )
 
       {:ok, payload} ->
@@ -417,7 +486,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -434,9 +503,106 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
     end
   end
+
+  defp semantic_activity_state(thread_id) do
+    now_ms = System.monotonic_time(:millisecond)
+    now = DateTime.utc_now()
+
+    %{
+      thread_id: thread_id,
+      timeout_ms: Config.settings!().codex.semantic_inactivity_timeout_ms,
+      last_at_ms: now_ms,
+      last_at: now,
+      last_reason: "turn/start"
+    }
+  end
+
+  defp semantic_timeout_remaining_ms(%{timeout_ms: timeout_ms, last_at_ms: last_at_ms}) do
+    elapsed_ms = System.monotonic_time(:millisecond) - last_at_ms
+    max(timeout_ms - elapsed_ms, 0)
+  end
+
+  defp semantic_timeout_payload(%{timeout_ms: timeout_ms, last_at: last_at, last_reason: last_reason}) do
+    %{
+      timeout_ms: timeout_ms,
+      last_activity_at: last_at,
+      last_activity_reason: last_reason
+    }
+  end
+
+  defp mark_semantic_activity(activity, method, payload, metadata) do
+    case semantic_activity_reason(method, payload) do
+      nil ->
+        {activity, metadata}
+
+      reason ->
+        now = DateTime.utc_now()
+
+        updated_activity = %{
+          activity
+          | last_at_ms: System.monotonic_time(:millisecond),
+            last_at: now,
+            last_reason: reason
+        }
+
+        updated_metadata =
+          metadata
+          |> Map.put(:semantic_activity_at, now)
+          |> Map.put(:semantic_activity_reason, reason)
+
+        {updated_activity, updated_metadata}
+    end
+  end
+
+  defp semantic_activity_reason("turn/started", _payload), do: "turn started"
+  defp semantic_activity_reason("turn/diff/updated", _payload), do: "codex diff updated"
+  defp semantic_activity_reason("item/agentMessage/delta", _payload), do: "agent message delta"
+  defp semantic_activity_reason("item/commandExecution/outputDelta", _payload), do: "command output delta"
+  defp semantic_activity_reason("item/fileChange/outputDelta", _payload), do: "file change output delta"
+  defp semantic_activity_reason("item/mcpToolCall/progress", _payload), do: "mcp tool progress"
+  defp semantic_activity_reason("item/tool/call", _payload), do: "dynamic tool call"
+  defp semantic_activity_reason("item/commandExecution/requestApproval", _payload), do: "command approval requested"
+  defp semantic_activity_reason("item/fileChange/requestApproval", _payload), do: "file change approval requested"
+  defp semantic_activity_reason("execCommandApproval", _payload), do: "command approval requested"
+  defp semantic_activity_reason("applyPatchApproval", _payload), do: "file change approval requested"
+  defp semantic_activity_reason("item/tool/requestUserInput", _payload), do: "tool user input requested"
+  defp semantic_activity_reason(_method, _payload), do: nil
+
+  defp foreign_thread_notification?(payload, active_thread_id) when is_map(payload) and is_binary(active_thread_id) do
+    case payload_thread_id(payload) do
+      thread_id when is_binary(thread_id) and thread_id != active_thread_id -> true
+      _ -> false
+    end
+  end
+
+  defp foreign_thread_notification?(_payload, _active_thread_id), do: false
+
+  defp payload_thread_id(payload) when is_map(payload) do
+    params = Map.get(payload, "params") || Map.get(payload, :params) || %{}
+
+    Map.get(payload, "threadId") ||
+      Map.get(payload, :threadId) ||
+      map_get(params, "threadId") ||
+      map_get(params, "thread_id") ||
+      thread_id_from_nested(map_get(params, "thread")) ||
+      thread_id_from_nested(map_get(params, "item"))
+  end
+
+  defp payload_thread_id(_payload), do: nil
+
+  defp thread_id_from_nested(%{} = value), do: map_get(value, "id") || map_get(value, "threadId")
+  defp thread_id_from_nested(_value), do: nil
+
+  defp map_get(%{} = map, key) when is_binary(key) do
+    Map.get(map, key) || Map.get(map, String.to_atom(key))
+  rescue
+    ArgumentError -> Map.get(map, key)
+  end
+
+  defp map_get(_map, _key), do: nil
 
   defp emit_turn_event(on_message, event, payload, payload_string, port, payload_details) do
     emit_message(
@@ -457,47 +623,27 @@ defmodule SymphonyElixir.Codex.AppServer do
          payload,
          payload_string,
          method,
-         timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         activity
        ) do
-    metadata = metadata_from_message(port, payload)
+    if foreign_thread_notification?(payload, activity.thread_id) do
+      receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+    else
+      metadata = metadata_from_message(port, payload)
+      {activity, metadata} = mark_semantic_activity(activity, method, payload, metadata)
 
-    case maybe_handle_approval_request(
-           port,
-           method,
-           payload,
-           payload_string,
-           on_message,
-           metadata,
-           tool_executor,
-           auto_approve_requests
-         ) do
-      :input_required ->
-        emit_message(
-          on_message,
-          :turn_input_required,
-          %{payload: payload, raw: payload_string},
-          metadata
-        )
-
-        {:error, {:turn_input_required, payload}}
-
-      :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
-
-      :approval_required ->
-        emit_message(
-          on_message,
-          :approval_required,
-          %{payload: payload, raw: payload_string},
-          metadata
-        )
-
-        {:error, {:approval_required, payload}}
-
-      :unhandled ->
-        if needs_input?(method, payload) do
+      case maybe_handle_approval_request(
+             port,
+             method,
+             payload,
+             payload_string,
+             on_message,
+             metadata,
+             tool_executor,
+             auto_approve_requests
+           ) do
+        :input_required ->
           emit_message(
             on_message,
             :turn_input_required,
@@ -506,20 +652,45 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           {:error, {:turn_input_required, payload}}
-        else
+
+        :approved ->
+          receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+
+        :approval_required ->
           emit_message(
             on_message,
-            :notification,
-            %{
-              payload: payload,
-              raw: payload_string
-            },
+            :approval_required,
+            %{payload: payload, raw: payload_string},
             metadata
           )
 
-          Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
-        end
+          {:error, {:approval_required, payload}}
+
+        :unhandled ->
+          if needs_input?(method, payload) do
+            emit_message(
+              on_message,
+              :turn_input_required,
+              %{payload: payload, raw: payload_string},
+              metadata
+            )
+
+            {:error, {:turn_input_required, payload}}
+          else
+            emit_message(
+              on_message,
+              :notification,
+              %{
+                payload: payload,
+                raw: payload_string
+              },
+              metadata
+            )
+
+            Logger.debug("Codex notification: #{inspect(method)}")
+            receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+          end
+      end
     end
   end
 
@@ -670,6 +841,19 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp maybe_handle_approval_request(
          _port,
+         "mcpServer/elicitation/request",
+         %{"id" => _id, "params" => _params} = _payload,
+         _payload_string,
+         _on_message,
+         _metadata,
+         _tool_executor,
+         _auto_approve_requests
+       ) do
+    :approval_required
+  end
+
+  defp maybe_handle_approval_request(
+         _port,
          _method,
          _payload,
          _payload_string,
@@ -729,6 +913,27 @@ defmodule SymphonyElixir.Codex.AppServer do
          metadata,
          true
        ) do
+    approve_request(port, id, decision, payload, payload_string, on_message, metadata)
+  end
+
+  defp approve_or_require(
+         port,
+         id,
+         decision,
+         payload,
+         payload_string,
+         on_message,
+         metadata,
+         false
+       ) do
+    if safe_bookkeeping_approval?(payload) do
+      approve_request(port, id, decision, payload, payload_string, on_message, metadata)
+    else
+      :approval_required
+    end
+  end
+
+  defp approve_request(port, id, decision, payload, payload_string, on_message, metadata) do
     send_message(port, %{"id" => id, "result" => %{"decision" => decision}})
 
     emit_message(
@@ -741,17 +946,160 @@ defmodule SymphonyElixir.Codex.AppServer do
     :approved
   end
 
-  defp approve_or_require(
-         _port,
-         _id,
-         _decision,
-         _payload,
-         _payload_string,
-         _on_message,
-         _metadata,
-         false
-       ) do
-    :approval_required
+  defp safe_bookkeeping_approval?(%{"method" => "item/commandExecution/requestApproval", "params" => params})
+       when is_map(params) do
+    commands = approval_commands(params)
+
+    Enum.any?(commands, &safe_github_issue_label_command?/1) or
+      (safe_repo_validation_cwd?(Map.get(params, "cwd")) and
+         Enum.any?(commands, &safe_repo_validation_command?/1))
+  end
+
+  defp safe_bookkeeping_approval?(_payload), do: false
+
+  defp approval_commands(params) when is_map(params) do
+    [
+      Map.get(params, "command"),
+      Map.get(params, "parsedCmd")
+      | command_action_commands(Map.get(params, "commandActions"))
+    ]
+    |> Enum.filter(&is_binary/1)
+  end
+
+  defp command_action_commands(actions) when is_list(actions) do
+    actions
+    |> Enum.map(fn
+      %{"command" => command} when is_binary(command) -> command
+      %{command: command} when is_binary(command) -> command
+      _ -> nil
+    end)
+    |> Enum.filter(&is_binary/1)
+  end
+
+  defp command_action_commands(_actions), do: []
+
+  defp safe_github_issue_label_command?(command) when is_binary(command) do
+    command
+    |> unwrap_shell_command()
+    |> github_issue_bookkeeping_command?()
+  end
+
+  defp safe_github_issue_label_command?(_command), do: false
+
+  defp safe_repo_validation_command?(command) when is_binary(command) do
+    command
+    |> unwrap_shell_command()
+    |> repo_validation_command?()
+  end
+
+  defp safe_repo_validation_command?(_command), do: false
+
+  defp repo_validation_command?(command) when is_binary(command) do
+    String.trim(command) in [
+      "npm test",
+      "npm run test",
+      "npm run typecheck",
+      "npm run lint"
+    ]
+  end
+
+  defp safe_repo_validation_cwd?(cwd) when is_binary(cwd) do
+    expanded_cwd = Path.expand(cwd)
+    expanded_root = Path.expand(Config.settings!().workspace.root)
+
+    with {:ok, canonical_cwd} <- PathSafety.canonicalize(expanded_cwd),
+         {:ok, canonical_root} <- PathSafety.canonicalize(expanded_root) do
+      canonical_root_prefix = canonical_root <> "/"
+      canonical_cwd != canonical_root and String.starts_with?(canonical_cwd <> "/", canonical_root_prefix)
+    else
+      _ -> false
+    end
+  end
+
+  defp safe_repo_validation_cwd?(_cwd), do: false
+
+  defp unwrap_shell_command(command) when is_binary(command) do
+    trimmed = String.trim(command)
+
+    case Regex.run(~r/\A(?:\/bin\/)?(?:zsh|bash|sh)\s+-lc\s+'([^']+)'\z/, trimmed) do
+      [_, inner] -> inner
+      _ -> trimmed
+    end
+  end
+
+  defp github_issue_bookkeeping_command?(command) when is_binary(command) do
+    github_issue_label_command?(command) or github_issue_comment_command?(command)
+  end
+
+  defp github_issue_label_command?(command) when is_binary(command) do
+    case String.split(command, ~r/\s+/, trim: true) do
+      ["gh", "issue", "edit", issue_number | flags] ->
+        github_issue_number?(issue_number) and github_issue_label_flags?(flags)
+
+      _ ->
+        false
+    end
+  end
+
+  defp github_issue_comment_command?(command) when is_binary(command) do
+    case Regex.run(~r/\Agh issue comment ([1-9][0-9]*) --repo ([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+) --body [\s\S]+\z/, command) do
+      [_, issue_number, repo] -> github_issue_number?(issue_number) and repo == configured_github_repo()
+      _ -> false
+    end
+  end
+
+  defp github_issue_number?(issue_number) when is_binary(issue_number) do
+    String.match?(issue_number, ~r/\A[1-9][0-9]*\z/)
+  end
+
+  defp github_issue_label_flags?(flags) when is_list(flags) do
+    case parse_github_issue_label_flags(flags, %{repo: nil, labels: []}) do
+      {:ok, %{repo: repo, labels: labels}} ->
+        repo == configured_github_repo() and labels != [] and Enum.all?(labels, &(&1 in @github_issue_state_labels))
+
+      :error ->
+        false
+    end
+  end
+
+  defp parse_github_issue_label_flags([], acc), do: {:ok, acc}
+
+  defp parse_github_issue_label_flags(["--repo", repo | rest], acc) when is_binary(repo) do
+    if valid_github_repo?(repo) do
+      parse_github_issue_label_flags(rest, %{acc | repo: repo})
+    else
+      :error
+    end
+  end
+
+  defp parse_github_issue_label_flags(["--add-label", label | rest], acc) when is_binary(label) do
+    parse_github_issue_label_flags(rest, %{acc | labels: [label | acc.labels]})
+  end
+
+  defp parse_github_issue_label_flags(["--remove-label", label | rest], acc) when is_binary(label) do
+    parse_github_issue_label_flags(rest, %{acc | labels: [label | acc.labels]})
+  end
+
+  defp parse_github_issue_label_flags(_flags, _acc), do: :error
+
+  defp valid_github_repo?(repo) when is_binary(repo) do
+    String.match?(repo, ~r/\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\z/)
+  end
+
+  defp configured_github_repo do
+    case Config.primary_repo() do
+      %{owner: owner, name: name} when is_binary(owner) and is_binary(name) ->
+        "#{owner}/#{name}"
+
+      _ ->
+        case Config.settings!().tracker do
+          %{kind: "github", owner: owner, repo: repo} when is_binary(owner) and is_binary(repo) ->
+            "#{owner}/#{repo}"
+
+          _ ->
+            nil
+        end
+    end
   end
 
   defp maybe_auto_answer_tool_request_user_input(

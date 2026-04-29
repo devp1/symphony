@@ -589,7 +589,7 @@ defmodule SymphonyElixir.StatusDashboard do
   # credo:disable-for-next-line
   defp format_running_summary(running_entry, running_event_width) do
     issue = format_cell(running_entry.identifier || "unknown", @running_id_width)
-    state = running_entry.state || "unknown"
+    state = Map.get(running_entry, :session_state) || running_entry.state || "unknown"
     state_display = format_cell(to_string(state), @running_stage_width)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
     pid = format_cell(running_entry.codex_app_server_pid || "n/a", @running_pid_width)
@@ -1363,6 +1363,18 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp humanize_codex_method("tool/requestUserInput", payload),
     do: humanize_codex_method("item/tool/requestUserInput", payload)
+
+  defp humanize_codex_method("mcpServer/elicitation/request", payload) do
+    tool_title =
+      map_path(payload, ["params", "_meta", "tool_title"]) ||
+        map_path(payload, [:params, :_meta, :tool_title])
+
+    if is_binary(tool_title) and String.trim(tool_title) != "" do
+      "MCP elicitation requested (#{inline_text(tool_title)})"
+    else
+      "MCP elicitation requested"
+    end
+  end
 
   defp humanize_codex_method("account/updated", payload) do
     auth_mode =

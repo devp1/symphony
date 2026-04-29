@@ -35,6 +35,7 @@ defmodule SymphonyElixir.TestSupport do
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
+        Application.put_env(:symphony_elixir, :storage_sqlite_path, Path.join(workflow_root, "symphony.sqlite3"))
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
         stop_default_http_server()
 
@@ -43,6 +44,7 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+          Application.delete_env(:symphony_elixir, :storage_sqlite_path)
           File.rm_rf(workflow_root)
         end)
 
@@ -92,11 +94,17 @@ defmodule SymphonyElixir.TestSupport do
     config =
       Keyword.merge(
         [
+          runtime_profile: "default",
           tracker_kind: "linear",
           tracker_endpoint: "https://api.linear.app/graphql",
           tracker_api_token: "token",
           tracker_project_slug: "project",
+          tracker_owner: nil,
+          tracker_repo: nil,
+          tracker_label: "symphony",
           tracker_assignee: nil,
+          repos: nil,
+          storage_sqlite_path: nil,
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
@@ -106,12 +114,17 @@ defmodule SymphonyElixir.TestSupport do
           max_concurrent_agents: 10,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
+          artifact_nudge_tokens: 250_000,
+          max_artifact_nudges: 1,
+          max_tokens_before_first_artifact: 200_000,
+          max_tokens_without_artifact: 250_000,
           max_concurrent_agents_by_state: %{},
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
           codex_turn_sandbox_policy: nil,
           codex_turn_timeout_ms: 3_600_000,
+          codex_semantic_inactivity_timeout_ms: 1_800_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
           hook_after_create: nil,
@@ -130,10 +143,16 @@ defmodule SymphonyElixir.TestSupport do
       )
 
     tracker_kind = Keyword.get(config, :tracker_kind)
+    runtime_profile = Keyword.get(config, :runtime_profile)
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
+    tracker_owner = Keyword.get(config, :tracker_owner)
+    tracker_repo = Keyword.get(config, :tracker_repo)
+    tracker_label = Keyword.get(config, :tracker_label)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
+    repos = Keyword.get(config, :repos)
+    storage_sqlite_path = Keyword.get(config, :storage_sqlite_path)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
@@ -143,12 +162,17 @@ defmodule SymphonyElixir.TestSupport do
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
+    artifact_nudge_tokens = Keyword.get(config, :artifact_nudge_tokens)
+    max_artifact_nudges = Keyword.get(config, :max_artifact_nudges)
+    max_tokens_before_first_artifact = Keyword.get(config, :max_tokens_before_first_artifact)
+    max_tokens_without_artifact = Keyword.get(config, :max_tokens_without_artifact)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
     codex_turn_sandbox_policy = Keyword.get(config, :codex_turn_sandbox_policy)
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
+    codex_semantic_inactivity_timeout_ms = Keyword.get(config, :codex_semantic_inactivity_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
     hook_after_create = Keyword.get(config, :hook_after_create)
@@ -166,14 +190,19 @@ defmodule SymphonyElixir.TestSupport do
     sections =
       [
         "---",
+        "runtime_profile: #{yaml_value(runtime_profile)}",
         "tracker:",
         "  kind: #{yaml_value(tracker_kind)}",
         "  endpoint: #{yaml_value(tracker_endpoint)}",
         "  api_key: #{yaml_value(tracker_api_token)}",
         "  project_slug: #{yaml_value(tracker_project_slug)}",
+        "  owner: #{yaml_value(tracker_owner)}",
+        "  repo: #{yaml_value(tracker_repo)}",
+        "  label: #{yaml_value(tracker_label)}",
         "  assignee: #{yaml_value(tracker_assignee)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
+        repos_yaml(repos),
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
@@ -183,6 +212,10 @@ defmodule SymphonyElixir.TestSupport do
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
+        "  artifact_nudge_tokens: #{yaml_value(artifact_nudge_tokens)}",
+        "  max_artifact_nudges: #{yaml_value(max_artifact_nudges)}",
+        "  max_tokens_before_first_artifact: #{yaml_value(max_tokens_before_first_artifact)}",
+        "  max_tokens_without_artifact: #{yaml_value(max_tokens_without_artifact)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
@@ -190,17 +223,37 @@ defmodule SymphonyElixir.TestSupport do
         "  thread_sandbox: #{yaml_value(codex_thread_sandbox)}",
         "  turn_sandbox_policy: #{yaml_value(codex_turn_sandbox_policy)}",
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
+        "  semantic_inactivity_timeout_ms: #{yaml_value(codex_semantic_inactivity_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
+        storage_yaml(storage_sqlite_path),
         "---",
         prompt
       ]
       |> Enum.reject(&(&1 in [nil, ""]))
 
     Enum.join(sections, "\n") <> "\n"
+  end
+
+  defp repos_yaml(nil), do: nil
+
+  defp repos_yaml(repos) when is_list(repos) do
+    repo_lines =
+      Enum.flat_map(repos, fn repo ->
+        [
+          "  - id: #{yaml_value(Map.get(repo, :id) || Map.get(repo, "id"))}",
+          "    owner: #{yaml_value(Map.get(repo, :owner) || Map.get(repo, "owner"))}",
+          "    name: #{yaml_value(Map.get(repo, :name) || Map.get(repo, "name"))}",
+          "    clone_url: #{yaml_value(Map.get(repo, :clone_url) || Map.get(repo, "clone_url"))}",
+          "    workspace_root: #{yaml_value(Map.get(repo, :workspace_root) || Map.get(repo, "workspace_root"))}",
+          "    labels: #{yaml_value(Map.get(repo, :labels) || Map.get(repo, "labels") || %{})}"
+        ]
+      end)
+
+    Enum.join(["repos:" | repo_lines], "\n")
   end
 
   defp yaml_value(value) when is_binary(value) do
@@ -253,6 +306,12 @@ defmodule SymphonyElixir.TestSupport do
     ]
     |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")
+  end
+
+  defp storage_yaml(nil), do: nil
+
+  defp storage_yaml(sqlite_path) do
+    "storage:\n  sqlite_path: #{yaml_value(sqlite_path)}"
   end
 
   defp observability_yaml(enabled, refresh_ms, render_interval_ms) do

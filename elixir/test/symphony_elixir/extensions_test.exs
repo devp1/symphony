@@ -75,6 +75,21 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
+
+    def handle_call({:cancel_run, run_id}, _from, state) do
+      response = Keyword.get(state, :cancel_response, {:ok, %{run_id: run_id}})
+      {:reply, response, state}
+    end
+
+    def handle_call({:rerun_issue, repo_id, number}, _from, state) do
+      response = Keyword.get(state, :rerun_response, {:ok, %{repo_id: repo_id, number: to_string(number), queued: true}})
+      {:reply, response, state}
+    end
+
+    def handle_call({:stop_issue_session, repo_id, number}, _from, state) do
+      response = Keyword.get(state, :stop_session_response, {:ok, %{repo_id: repo_id, number: to_string(number)}})
+      {:reply, response, state}
+    end
   end
 
   setup do
@@ -337,47 +352,88 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
+    :ok =
+      SymphonyElixir.Storage.upsert_repo(%{
+        id: "beacon",
+        owner: "devp1",
+        name: "Beacon",
+        clone_url: "https://github.com/devp1/Beacon.git",
+        workspace_root: "/tmp/beacon",
+        labels: %{"managed" => "symphony"}
+      })
+
+    :ok =
+      SymphonyElixir.Storage.record_issue_snapshot(%{
+        repo_id: "beacon",
+        number: 10,
+        identifier: "beacon-10",
+        title: "Runner proof",
+        state: "Todo",
+        labels: ["symphony", "agent-ready"]
+      })
+
+    {:ok, run_id} =
+      SymphonyElixir.Storage.start_run(%{
+        repo_id: "beacon",
+        issue_number: 10,
+        issue_identifier: "beacon-10",
+        state: "running"
+      })
+
+    :ok = SymphonyElixir.Storage.append_event(run_id, "info", "started", %{})
+
     conn = get(build_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
 
-    assert state_payload == %{
-             "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1},
-             "running" => [
-               %{
-                 "issue_id" => "issue-http",
-                 "issue_identifier" => "MT-HTTP",
-                 "state" => "In Progress",
-                 "worker_host" => nil,
-                 "workspace_path" => nil,
-                 "session_id" => "thread-http",
-                 "turn_count" => 7,
-                 "last_event" => "notification",
-                 "last_message" => "rendered",
-                 "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
-                 "last_event_at" => nil,
-                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
-               }
-             ],
-             "retrying" => [
-               %{
-                 "issue_id" => "issue-retry",
-                 "issue_identifier" => "MT-RETRY",
-                 "attempt" => 2,
-                 "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
-                 "error" => "boom",
-                 "worker_host" => nil,
-                 "workspace_path" => nil
-               }
-             ],
-             "codex_totals" => %{
-               "input_tokens" => 4,
-               "output_tokens" => 8,
-               "total_tokens" => 12,
-               "seconds_running" => 42.5
-             },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
-           }
+    assert state_payload["counts"] == %{"running" => 1, "parked" => 0, "retrying" => 1}
+    assert state_payload["codex_totals"] == %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12, "seconds_running" => 42.5}
+    assert state_payload["rate_limits"] == %{"primary" => %{"remaining" => 11}}
+
+    assert [
+             %{
+               "issue_id" => "issue-http",
+               "issue_identifier" => "MT-HTTP",
+               "state" => "In Progress",
+               "repo_id" => "beacon",
+               "issue_number" => 10,
+               "run_id" => "run-http",
+               "pr_url" => "https://github.com/devp1/Beacon/pull/10",
+               "pr_state" => "OPEN",
+               "check_state" => "passing",
+               "review_state" => "APPROVED",
+               "session_id" => "thread-http",
+               "turn_count" => 7,
+               "last_event" => "notification",
+               "last_message" => "rendered",
+               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+             }
+           ] = state_payload["running"]
+
+    assert [
+             %{
+               "issue_id" => "issue-retry",
+               "issue_identifier" => "MT-RETRY",
+               "attempt" => 2,
+               "error" => "boom"
+             }
+           ] = state_payload["retrying"]
+
+    assert Enum.any?(state_payload["issues"], &match?(%{"identifier" => "beacon-10", "labels" => ["symphony", "agent-ready"]}, &1))
+    assert Enum.any?(state_payload["runs"], &match?(%{"id" => ^run_id, "state" => "running", "pr_url" => nil}, &1))
+
+    assert %{"issues" => issues_payload} = json_response(get(build_conn(), "/api/v1/issues"), 200)
+    assert Enum.any?(issues_payload, &match?(%{"identifier" => "beacon-10"}, &1))
+
+    assert %{"repos" => []} = json_response(get(build_conn(), "/api/v1/repos"), 200)
+
+    assert %{"id" => ^run_id, "events" => [%{"message" => "started"}]} =
+             json_response(get(build_conn(), "/api/v1/runs/#{run_id}"), 200)
+
+    assert %{"ok" => true, "action" => "cancel_requested"} =
+             json_response(post(build_conn(), "/api/v1/runs/#{run_id}/cancel", %{}), 202)
+
+    assert %{"ok" => true, "action" => "rerun_requested"} =
+             json_response(post(build_conn(), "/api/v1/issues/beacon/10/rerun", %{}), 202)
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
     issue_payload = json_response(conn, 200)
@@ -394,6 +450,17 @@ defmodule SymphonyElixir.ExtensionsTest do
              "running" => %{
                "worker_host" => nil,
                "workspace_path" => nil,
+               "issue_session_id" => nil,
+               "session_kind" => nil,
+               "session_state" => nil,
+               "health" => ["healthy"],
+               "thread_id" => nil,
+               "pr_url" => "https://github.com/devp1/Beacon/pull/10",
+               "pr_state" => "OPEN",
+               "check_state" => "passing",
+               "review_state" => "APPROVED",
+               "parked_at" => nil,
+               "stop_reason" => nil,
                "session_id" => "thread-http",
                "turn_count" => 7,
                "state" => "In Progress",
@@ -401,6 +468,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event" => "notification",
                "last_message" => "rendered",
                "last_event_at" => nil,
+               "last_semantic_activity_at" => nil,
+               "last_semantic_activity_reason" => nil,
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
              },
              "retry" => nil,
@@ -539,21 +608,33 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     {:ok, view, html} = live(build_conn(), "/")
-    assert html =~ "Operations Dashboard"
+    assert html =~ "GitHub Control Plane"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "rendered"
     assert html =~ "Runtime"
+    assert html =~ "Issue board"
+    assert html =~ "Run history"
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
+    assert html =~ "Controls"
+    assert html =~ "Cancel"
+    assert html =~ "Rerun"
+    assert html =~ "Stop Session"
+    assert html =~ "PR handoff"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
-    refute html =~ "Refresh now"
+    assert html =~ "Refresh now"
     refute html =~ "Transport"
     assert html =~ "status-badge-live"
     assert html =~ "status-badge-offline"
+
+    assert render_click(view, "refresh") =~ "Refresh queued"
+    assert render_click(view, "cancel-run", %{"run-id" => "run-http"}) =~ "Cancel requested"
+    assert render_click(view, "rerun-issue", %{"repo-id" => "beacon", "number" => "10"}) =~ "Rerun queued"
+    assert render_click(view, "stop-session", %{"repo-id" => "beacon", "number" => "10"}) =~ "Stop requested"
 
     updated_snapshot =
       put_in(snapshot.running, [
@@ -561,6 +642,9 @@ defmodule SymphonyElixir.ExtensionsTest do
           issue_id: "issue-http",
           identifier: "MT-HTTP",
           state: "In Progress",
+          repo_id: "beacon",
+          issue_number: 10,
+          run_id: "run-http",
           session_id: "thread-http",
           turn_count: 8,
           last_codex_event: :notification,
@@ -581,6 +665,10 @@ defmodule SymphonyElixir.ExtensionsTest do
           codex_input_tokens: 10,
           codex_output_tokens: 12,
           codex_total_tokens: 22,
+          pr_url: "https://github.com/devp1/Beacon/pull/10",
+          pr_state: "OPEN",
+          check_state: "pending",
+          review_state: "REVIEW_REQUIRED",
           started_at: DateTime.utc_now()
         }
       ])
@@ -641,7 +729,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1}
+    assert response.body["counts"] == %{"running" => 1, "parked" => 0, "retrying" => 1}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -690,8 +778,15 @@ defmodule SymphonyElixir.ExtensionsTest do
           issue_id: "issue-http",
           identifier: "MT-HTTP",
           state: "In Progress",
+          repo_id: "beacon",
+          issue_number: 10,
+          run_id: "run-http",
           session_id: "thread-http",
           turn_count: 7,
+          pr_url: "https://github.com/devp1/Beacon/pull/10",
+          pr_state: "OPEN",
+          check_state: "passing",
+          review_state: "APPROVED",
           codex_app_server_pid: nil,
           last_codex_message: "rendered",
           last_codex_timestamp: nil,

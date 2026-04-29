@@ -61,6 +61,21 @@ defmodule SymphonyElixir.Config do
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
 
+  @spec repos() :: [map()]
+  def repos do
+    settings!().repos
+  end
+
+  @spec repo_by_id(String.t()) :: map() | nil
+  def repo_by_id(repo_id) when is_binary(repo_id) do
+    Enum.find(repos(), &(&1.id == repo_id))
+  end
+
+  @spec primary_repo() :: map() | nil
+  def primary_repo do
+    List.first(repos())
+  end
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do
@@ -107,7 +122,7 @@ defmodule SymphonyElixir.Config do
         {:ok,
          %{
            approval_policy: settings.codex.approval_policy,
-           thread_sandbox: settings.codex.thread_sandbox,
+           thread_sandbox: Schema.resolve_thread_sandbox(settings, opts),
            turn_sandbox_policy: turn_sandbox_policy
          }}
       end
@@ -115,23 +130,35 @@ defmodule SymphonyElixir.Config do
   end
 
   defp validate_semantics(settings) do
-    cond do
-      is_nil(settings.tracker.kind) ->
-        {:error, :missing_tracker_kind}
-
-      settings.tracker.kind not in ["linear", "memory"] ->
-        {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_linear_project_slug}
-
-      true ->
-        :ok
+    case validate_tracker_kind(settings.tracker) do
+      :ok -> validate_tracker_settings(settings)
+      {:error, reason} -> {:error, reason}
     end
   end
+
+  defp validate_tracker_settings(%{tracker: %{kind: "linear"} = tracker}), do: validate_linear_tracker(tracker)
+  defp validate_tracker_settings(%{tracker: %{kind: "github"} = tracker} = settings), do: validate_github_tracker(settings, tracker)
+  defp validate_tracker_settings(_settings), do: :ok
+
+  defp validate_tracker_kind(%{kind: nil}), do: {:error, :missing_tracker_kind}
+
+  defp validate_tracker_kind(%{kind: kind}) when kind not in ["linear", "memory", "github"],
+    do: {:error, {:unsupported_tracker_kind, kind}}
+
+  defp validate_tracker_kind(_tracker), do: :ok
+
+  defp validate_linear_tracker(%{kind: "linear", api_key: api_key}) when not is_binary(api_key),
+    do: {:error, :missing_linear_api_token}
+
+  defp validate_linear_tracker(%{kind: "linear", project_slug: project_slug}) when not is_binary(project_slug),
+    do: {:error, :missing_linear_project_slug}
+
+  defp validate_linear_tracker(_tracker), do: :ok
+
+  defp validate_github_tracker(%{repos: [_ | _]}, _tracker), do: :ok
+  defp validate_github_tracker(_settings, %{owner: owner}) when not is_binary(owner), do: {:error, :missing_github_owner}
+  defp validate_github_tracker(_settings, %{repo: repo}) when not is_binary(repo), do: {:error, :missing_github_repo}
+  defp validate_github_tracker(_settings, _tracker), do: :ok
 
   defp format_config_error(reason) do
     case reason do

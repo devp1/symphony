@@ -5,6 +5,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
+  alias SymphonyElixir.Orchestrator
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
@@ -13,6 +14,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
     socket =
       socket
       |> assign(:payload, load_payload())
+      |> assign(:action_notice, nil)
       |> assign(:now, DateTime.utc_now())
 
     if connected?(socket) do
@@ -38,6 +40,47 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
+  def handle_event("refresh", _params, socket) do
+    notice =
+      case Presenter.refresh_payload(orchestrator()) do
+        {:ok, payload} -> "Refresh queued: #{Enum.join(Map.get(payload, :operations, []), ", ")}"
+        {:error, reason} -> "Refresh failed: #{inspect(reason)}"
+      end
+
+    {:noreply, reload_with_notice(socket, notice)}
+  end
+
+  def handle_event("cancel-run", %{"run-id" => run_id}, socket) do
+    notice =
+      case Orchestrator.cancel_run(run_id, orchestrator()) do
+        {:ok, _payload} -> "Cancel requested for #{run_id}"
+        {:error, reason} -> "Cancel failed for #{run_id}: #{inspect(reason)}"
+      end
+
+    {:noreply, reload_with_notice(socket, notice)}
+  end
+
+  def handle_event("rerun-issue", %{"repo-id" => repo_id, "number" => number}, socket) do
+    notice =
+      case Orchestrator.rerun_issue(repo_id, number, orchestrator()) do
+        {:ok, _payload} -> "Rerun queued for #{repo_id}##{number}"
+        {:error, reason} -> "Rerun failed for #{repo_id}##{number}: #{inspect(reason)}"
+      end
+
+    {:noreply, reload_with_notice(socket, notice)}
+  end
+
+  def handle_event("stop-session", %{"repo-id" => repo_id, "number" => number}, socket) do
+    notice =
+      case Orchestrator.stop_issue_session(repo_id, number, orchestrator()) do
+        {:ok, _payload} -> "Stop requested for #{repo_id}##{number}"
+        {:error, reason} -> "Stop failed for #{repo_id}##{number}: #{inspect(reason)}"
+      end
+
+    {:noreply, reload_with_notice(socket, notice)}
+  end
+
+  @impl true
   def render(assigns) do
     ~H"""
     <section class="dashboard-shell">
@@ -45,17 +88,20 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <div class="hero-grid">
           <div>
             <p class="eyebrow">
-              Symphony Observability
+              Symphony Cockpit
             </p>
             <h1 class="hero-title">
-              Operations Dashboard
+              GitHub Control Plane
             </h1>
             <p class="hero-copy">
-              Current state, retry pressure, token usage, and orchestration health for the active Symphony runtime.
+              GitHub issues, autonomous Codex runs, evidence, and PR handoff state for the active Symphony runtime.
             </p>
           </div>
 
           <div class="status-stack">
+            <button type="button" class="subtle-button" phx-click="refresh">
+              Refresh now
+            </button>
             <span class="status-badge status-badge-live">
               <span class="status-badge-dot"></span>
               Live
@@ -67,6 +113,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </div>
         </div>
       </header>
+
+      <%= if @action_notice do %>
+        <section class="notice-card">
+          <%= @action_notice %>
+        </section>
+      <% end %>
 
       <%= if @payload[:error] do %>
         <section class="error-card">
@@ -109,6 +161,76 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <section class="section-card">
           <div class="section-header">
             <div>
+              <h2 class="section-title">Repos</h2>
+              <p class="section-copy">Configured GitHub repositories managed by this local cockpit.</p>
+            </div>
+          </div>
+
+          <%= if @payload.repos == [] do %>
+            <p class="empty-state">No GitHub repos configured yet.</p>
+          <% else %>
+            <div class="repo-strip">
+              <article :for={repo <- @payload.repos} class="repo-pill">
+                <strong><%= repo.owner %>/<%= repo.name %></strong>
+                <span class="mono"><%= repo.id %></span>
+              </article>
+            </div>
+          <% end %>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Issue board</h2>
+              <p class="section-copy">GitHub label states are the durable queue; Symphony augments them with run history and evidence.</p>
+            </div>
+          </div>
+
+          <%= if @payload.issues == [] do %>
+            <p class="empty-state">No issue snapshots yet. The next GitHub poll will populate this board.</p>
+          <% else %>
+            <div class="kanban-grid">
+              <article :for={column <- issue_columns()} class="kanban-column">
+                <div class="kanban-column-header">
+                  <h3><%= column %></h3>
+                  <span class="mono"><%= length(issues_for_state(@payload.issues, column)) %></span>
+                </div>
+                <div class="kanban-card-stack">
+                  <article
+                    :for={issue <- issues_for_state(@payload.issues, column)}
+                    class="kanban-card"
+                  >
+                    <a
+                      class="kanban-card-primary"
+                      href={issue["url"] || "#"}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      <span class="issue-id"><%= issue["identifier"] %></span>
+                      <strong><%= issue["title"] || "Untitled issue" %></strong>
+                    </a>
+                    <span class="muted"><%= issue["repo_id"] %></span>
+                    <div class="card-meta-row">
+                      <%= if present?(issue["pr_url"]) do %>
+                        <a class="meta-pill meta-link" href={issue["pr_url"]} target="_blank" rel="noopener noreferrer">PR handoff</a>
+                      <% end %>
+                      <%= if present?(issue["check_state"]) do %>
+                        <span class={state_badge_class(issue["check_state"])}><%= issue["check_state"] %></span>
+                      <% end %>
+                      <%= if present?(issue["review_state"]) do %>
+                        <span class="meta-pill"><%= issue["review_state"] %></span>
+                      <% end %>
+                    </div>
+                  </article>
+                </div>
+              </article>
+            </div>
+          <% end %>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
               <h2 class="section-title">Rate limits</h2>
               <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
             </div>
@@ -120,8 +242,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <section class="section-card">
           <div class="section-header">
             <div>
-              <h2 class="section-title">Running sessions</h2>
-              <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
+              <h2 class="section-title">Active runs</h2>
+              <p class="section-copy">Live Codex sessions, last known agent activity, watchdog markers, and token usage.</p>
             </div>
           </div>
 
@@ -137,6 +259,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                   <col style="width: 8.5rem;" />
                   <col />
                   <col style="width: 10rem;" />
+                  <col style="width: 12rem;" />
                 </colgroup>
                 <thead>
                   <tr>
@@ -146,6 +269,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <th>Runtime / turns</th>
                     <th>Codex update</th>
                     <th>Tokens</th>
+                    <th>Controls</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -154,6 +278,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <div class="issue-stack">
                         <span class="issue-id"><%= entry.issue_identifier %></span>
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <%= if entry.pr_url do %>
+                          <a class="issue-link" href={entry.pr_url} target="_blank" rel="noopener noreferrer">PR handoff</a>
+                        <% end %>
                       </div>
                     </td>
                     <td>
@@ -198,6 +325,65 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
                         <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
                       </div>
+                    </td>
+                    <td>
+                      <div class="action-stack">
+                        <%= if entry.run_id do %>
+                          <button type="button" class="subtle-button danger-button" phx-click="cancel-run" phx-value-run-id={entry.run_id}>
+                            Cancel
+                          </button>
+                        <% end %>
+                        <%= if entry.repo_id && entry.issue_number do %>
+                          <button type="button" class="subtle-button secondary-action" phx-click="rerun-issue" phx-value-repo-id={entry.repo_id} phx-value-number={entry.issue_number}>
+                            Rerun
+                          </button>
+                          <button type="button" class="subtle-button secondary-action" phx-click="stop-session" phx-value-repo-id={entry.repo_id} phx-value-number={entry.issue_number}>
+                            Stop Session
+                          </button>
+                        <% end %>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Run history</h2>
+              <p class="section-copy">SQLite-backed ledger of recent autonomous attempts.</p>
+            </div>
+          </div>
+
+          <%= if @payload.runs == [] do %>
+            <p class="empty-state">No persisted run history yet.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Run</th>
+                    <th>Issue</th>
+                    <th>State</th>
+                    <th>Session</th>
+                    <th>PR</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={run <- @payload.runs}>
+                    <td class="mono"><a href={"/api/v1/runs/#{run["id"]}"}><%= run["id"] %></a></td>
+                    <td><%= run["issue_identifier"] || "n/a" %></td>
+                    <td><span class={state_badge_class(run["state"])}><%= run["state"] %></span></td>
+                    <td class="mono"><%= run["session_id"] || "n/a" %></td>
+                    <td>
+                      <%= if run["pr_url"] do %>
+                        <a href={run["pr_url"]} target="_blank" rel="noopener noreferrer">PR</a>
+                      <% else %>
+                        <span class="muted">n/a</span>
+                      <% end %>
                     </td>
                   </tr>
                 </tbody>
@@ -251,6 +437,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp load_payload do
     Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
+  end
+
+  defp reload_with_notice(socket, notice) do
+    socket
+    |> assign(:payload, load_payload())
+    |> assign(:action_notice, notice)
+    |> assign(:now, DateTime.utc_now())
   end
 
   defp orchestrator do
@@ -320,6 +513,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
       true -> base
     end
   end
+
+  defp issue_columns do
+    ["Todo", "In Progress", "Human Review", "Needs Input", "Blocked", "Rework", "Merging", "Done", "Backlog"]
+  end
+
+  defp issues_for_state(issues, state) do
+    Enum.filter(issues, &(Map.get(&1, "state") == state))
+  end
+
+  defp present?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present?(value), do: not is_nil(value)
 
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)

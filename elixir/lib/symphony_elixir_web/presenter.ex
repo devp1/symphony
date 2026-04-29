@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, Storage}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -14,11 +14,16 @@ defmodule SymphonyElixirWeb.Presenter do
         %{
           generated_at: generated_at,
           counts: %{
-            running: length(snapshot.running),
+            running: Enum.count(snapshot.running, &(Map.get(&1, :session_state) != :parked)),
+            parked: Enum.count(snapshot.running, &(Map.get(&1, :session_state) == :parked)),
             retrying: length(snapshot.retrying)
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
+          issue_sessions: Storage.list_issue_sessions(),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
+          repos: repos_payload(),
+          issues: Storage.list_issues(),
+          runs: Storage.list_runs(50),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -57,6 +62,34 @@ defmodule SymphonyElixirWeb.Presenter do
 
       payload ->
         {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
+    end
+  end
+
+  @spec repos_payload() :: [map()]
+  def repos_payload do
+    Config.repos()
+    |> Enum.map(fn repo ->
+      %{
+        id: repo.id,
+        owner: repo.owner,
+        name: repo.name,
+        clone_url: repo.clone_url,
+        workspace_root: repo.workspace_root,
+        labels: repo.labels
+      }
+    end)
+  end
+
+  @spec issues_payload() :: [map()]
+  def issues_payload do
+    Storage.list_issues()
+  end
+
+  @spec run_payload(String.t()) :: {:ok, map()} | {:error, :run_not_found}
+  def run_payload(run_id) when is_binary(run_id) do
+    case Storage.get_run(run_id) do
+      %{} = run -> {:ok, run}
+      _ -> {:error, :run_not_found}
     end
   end
 
@@ -100,14 +133,30 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
       state: entry.state,
+      repo_id: Map.get(entry, :repo_id),
+      issue_number: Map.get(entry, :issue_number),
+      run_id: Map.get(entry, :run_id),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
+      issue_session_id: Map.get(entry, :issue_session_id),
+      session_kind: Map.get(entry, :session_kind),
+      session_state: Map.get(entry, :session_state),
+      health: Map.get(entry, :health, ["healthy"]),
+      thread_id: Map.get(entry, :thread_id),
+      pr_url: Map.get(entry, :pr_url),
+      pr_state: Map.get(entry, :pr_state),
+      check_state: Map.get(entry, :check_state),
+      review_state: Map.get(entry, :review_state),
+      parked_at: iso8601_or_string(Map.get(entry, :parked_at)),
+      stop_reason: Map.get(entry, :stop_reason),
       session_id: entry.session_id,
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
+      last_semantic_activity_at: iso8601_or_string(Map.get(entry, :last_semantic_activity_timestamp)),
+      last_semantic_activity_reason: Map.get(entry, :last_semantic_activity_reason),
       tokens: %{
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
@@ -132,6 +181,17 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       worker_host: Map.get(running, :worker_host),
       workspace_path: Map.get(running, :workspace_path),
+      issue_session_id: Map.get(running, :issue_session_id),
+      session_kind: Map.get(running, :session_kind),
+      session_state: Map.get(running, :session_state),
+      health: Map.get(running, :health, ["healthy"]),
+      thread_id: Map.get(running, :thread_id),
+      pr_url: Map.get(running, :pr_url),
+      pr_state: Map.get(running, :pr_state),
+      check_state: Map.get(running, :check_state),
+      review_state: Map.get(running, :review_state),
+      parked_at: iso8601_or_string(Map.get(running, :parked_at)),
+      stop_reason: Map.get(running, :stop_reason),
       session_id: running.session_id,
       turn_count: Map.get(running, :turn_count, 0),
       state: running.state,
@@ -139,6 +199,8 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event: running.last_codex_event,
       last_message: summarize_message(running.last_codex_message),
       last_event_at: iso8601(running.last_codex_timestamp),
+      last_semantic_activity_at: iso8601_or_string(Map.get(running, :last_semantic_activity_timestamp)),
+      last_semantic_activity_reason: Map.get(running, :last_semantic_activity_reason),
       tokens: %{
         input_tokens: running.codex_input_tokens,
         output_tokens: running.codex_output_tokens,
@@ -197,4 +259,8 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp iso8601(_datetime), do: nil
+
+  defp iso8601_or_string(%DateTime{} = datetime), do: iso8601(datetime)
+  defp iso8601_or_string(value) when is_binary(value), do: value
+  defp iso8601_or_string(_value), do: nil
 end

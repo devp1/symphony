@@ -8,8 +8,11 @@ defmodule SymphonyElixir.Tracker do
   @callback fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
+  @callback fetch_artifact_marker(String.t()) ::
+              {:ok, String.t(), term()} | :missing | {:error, term()}
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   @callback update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
+  @callback preflight() :: :ok | {:error, term()}
 
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues do
@@ -26,6 +29,12 @@ defmodule SymphonyElixir.Tracker do
     adapter().fetch_issue_states_by_ids(issue_ids)
   end
 
+  @spec fetch_artifact_marker(String.t()) ::
+          {:ok, String.t(), term()} | :missing | {:error, term()}
+  def fetch_artifact_marker(issue_id) do
+    adapter().fetch_artifact_marker(issue_id)
+  end
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
     adapter().create_comment(issue_id, body)
@@ -36,9 +45,15 @@ defmodule SymphonyElixir.Tracker do
     adapter().update_issue_state(issue_id, state_name)
   end
 
+  @spec preflight() :: :ok | {:error, term()}
+  def preflight do
+    adapter().preflight()
+  end
+
   @spec adapter() :: module()
   def adapter do
     case Config.settings!().tracker.kind do
+      "github" -> SymphonyElixir.GitHub.Adapter
       "memory" -> SymphonyElixir.Tracker.Memory
       _ -> SymphonyElixir.Linear.Adapter
     end

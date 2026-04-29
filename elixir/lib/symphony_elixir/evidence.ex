@@ -370,8 +370,6 @@ defmodule SymphonyElixir.Evidence do
     end
   end
 
-  defp parse_review_text(_text), do: {:error, :missing_review_text}
-
   defp normalize_review(%{} = review) do
     verdict =
       review

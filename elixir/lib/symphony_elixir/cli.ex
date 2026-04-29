@@ -66,20 +66,24 @@ defmodule SymphonyElixir.CLI do
   def run(workflow_path, deps, opts) do
     expanded_path = Path.expand(workflow_path)
 
-    if deps.file_regular?.(expanded_path) do
-      :ok = deps.set_workflow_file_path.(expanded_path)
+    case deps.file_regular?.(expanded_path) do
+      true -> run_existing_workflow(expanded_path, deps, opts)
+      false -> {:error, "Workflow file not found: #{expanded_path}"}
+    end
+  end
 
-      with :ok <- maybe_validate_runtime_freshness(expanded_path, opts, deps) do
-        case deps.ensure_all_started.() do
-          {:ok, _started_apps} ->
-            :ok
+  defp run_existing_workflow(expanded_path, deps, opts) do
+    :ok = deps.set_workflow_file_path.(expanded_path)
 
-          {:error, reason} ->
-            {:error, "Failed to start Symphony with workflow #{expanded_path}: #{inspect(reason)}"}
-        end
-      end
-    else
-      {:error, "Workflow file not found: #{expanded_path}"}
+    with :ok <- maybe_validate_runtime_freshness(expanded_path, opts, deps) do
+      start_symphony(expanded_path, deps)
+    end
+  end
+
+  defp start_symphony(expanded_path, deps) do
+    case deps.ensure_all_started.() do
+      {:ok, _started_apps} -> :ok
+      {:error, reason} -> {:error, "Failed to start Symphony with workflow #{expanded_path}: #{inspect(reason)}"}
     end
   end
 
@@ -131,8 +135,6 @@ defmodule SymphonyElixir.CLI do
   defp current_escript_path do
     case :escript.script_name() do
       path when is_list(path) -> {:ok, path |> List.to_string() |> Path.expand()}
-      path when is_binary(path) -> {:ok, Path.expand(path)}
-      _other -> {:skip, :not_escript}
     end
   rescue
     _error -> {:skip, :not_escript}

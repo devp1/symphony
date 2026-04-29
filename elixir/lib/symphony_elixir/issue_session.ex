@@ -11,7 +11,7 @@ defmodule SymphonyElixir.IssueSession do
   use GenServer
   require Logger
 
-  alias SymphonyElixir.{CodingAgent, Config, Evidence, Handoff, Linear.Issue, PromptBuilder}
+  alias SymphonyElixir.{AutonomousReview, CodingAgent, Config, Evidence, Handoff, Linear.Issue, PromptBuilder}
   alias SymphonyElixir.{Storage, Tracker, Workpad, Workspace}
 
   @type worker_host :: String.t() | nil
@@ -164,27 +164,33 @@ defmodule SymphonyElixir.IssueSession do
   end
 
   defp run_active_cycle(%__MODULE__{} = state) do
-    with {:ok, state} <- ensure_workspace(state) do
-      case apply_startup_handoff(state) do
-        {:continue, state} ->
-          run_cycle_after_startup_handoff(state)
+    case ensure_workspace(state) do
+      {:ok, state} ->
+        run_active_cycle_with_workspace(state)
 
-        {:continue_with_prompt, state, prompt} ->
-          state
-          |> Map.put(:cycle_kind, {:evidence_feedback, prompt})
-          |> run_cycle_after_startup_handoff()
+      {:error, reason} ->
+        {:error, state, reason}
+    end
+  end
 
-        {:park, state, reason} ->
-          {:park, state, reason}
+  defp run_active_cycle_with_workspace(%__MODULE__{} = state) do
+    case apply_startup_handoff(state) do
+      {:continue, state} ->
+        run_cycle_after_startup_handoff(state)
 
-        {:stop, state, reason} ->
-          {:stop, state, reason}
+      {:continue_with_prompt, state, prompt} ->
+        state
+        |> Map.put(:cycle_kind, {:evidence_feedback, prompt})
+        |> run_cycle_after_startup_handoff()
 
-        {:error, reason} ->
-          {:error, state, reason}
-      end
-    else
-      {:error, reason} -> {:error, state, reason}
+      {:park, state, reason} ->
+        {:park, state, reason}
+
+      {:stop, state, reason} ->
+        {:stop, state, reason}
+
+      {:error, reason} ->
+        {:error, state, reason}
     end
   end
 
@@ -466,8 +472,6 @@ defmodule SymphonyElixir.IssueSession do
     end
   end
 
-  defp maybe_apply_verified_handoff(state), do: {:ok, state}
-
   defp handoff_interrupt_sentinel(%{workspace: workspace, worker_host: nil} = state)
        when is_binary(workspace) do
     fn ->
@@ -500,6 +504,7 @@ defmodule SymphonyElixir.IssueSession do
       })
 
     with {:ok, state} <- maybe_gate_human_review_handoff(state, handoff, target_state, payload),
+         {:ok, state} <- maybe_run_autonomous_pr_review_handoff(state, handoff, target_state, payload),
          :ok <- Tracker.update_issue_state(issue_id, target_state),
          {:ok, refreshed_issue} <- fetch_single_issue_state(state),
          :ok <- verify_handoff_state(refreshed_issue, target_state) do
@@ -560,8 +565,6 @@ defmodule SymphonyElixir.IssueSession do
     end
   end
 
-  defp clear_verified_handoff_marker(_state, _payload), do: :ok
-
   defp maybe_gate_human_review_handoff(state, handoff, "Human Review", payload) do
     decision = Evidence.decision(state.workspace, state.issue, handoff)
     attempt = Evidence.next_attempt(state.run_id)
@@ -607,6 +610,228 @@ defmodule SymphonyElixir.IssueSession do
   end
 
   defp maybe_gate_human_review_handoff(state, _handoff, _target_state, _payload), do: {:ok, state}
+
+  defp maybe_run_autonomous_pr_review_handoff(state, handoff, "Human Review", payload) do
+    issue = issue_with_handoff_pr(state.issue, handoff)
+
+    cond do
+      Config.settings!().tracker.kind != "github" ->
+        {:ok, state}
+
+      not reviewable_pr?(issue) ->
+        _ =
+          Storage.append_event(state.run_id, "info", "autonomous review skipped", %{
+            issue_session_id: state.issue_session_id,
+            reason: "missing-pr",
+            handoff: payload
+          })
+
+        {:ok, state}
+
+      not Config.independent_github_reviewer?() ->
+        _ =
+          Storage.append_event(state.run_id, "info", "autonomous review skipped", %{
+            issue_session_id: state.issue_session_id,
+            reason: "missing-independent-reviewer-token",
+            handoff: payload
+          })
+
+        {:ok, %{state | issue: issue}}
+
+      true ->
+        run_autonomous_pr_review(%{state | issue: issue}, handoff)
+    end
+  end
+
+  defp maybe_run_autonomous_pr_review_handoff(state, _handoff, _target_state, _payload), do: {:ok, state}
+
+  defp run_autonomous_pr_review(state, handoff) do
+    review_runner =
+      Keyword.get(state.opts, :autonomous_review_runner, fn workspace, issue ->
+        AutonomousReview.review_and_publish(workspace, issue,
+          run_id: state.run_id,
+          issue_session_id: state.issue_session_id
+        )
+      end)
+
+    case review_runner.(state.workspace, state.issue) do
+      {:ok, review} ->
+        handle_autonomous_review_result(state, handoff, review)
+
+      {:error, reason} ->
+        review = %{
+          verdict: "needs_input",
+          summary: "Autonomous PR review failed to complete",
+          findings: [%{reason: inspect(reason)}]
+        }
+
+        report_autonomous_review_needs_input(state, handoff, review, reason)
+    end
+  end
+
+  defp handle_autonomous_review_result(state, handoff, review) do
+    verdict = AutonomousReview.normalize_verdict(review_value(review, :verdict) || "needs_input")
+
+    case verdict do
+      "pass" ->
+        _ =
+          Storage.append_event(state.run_id, "info", "autonomous review passed", %{
+            issue_session_id: state.issue_session_id,
+            verdict: verdict,
+            summary: review_value(review, :summary),
+            output_path: review_value(review, :output_path)
+          })
+
+        {:ok, state}
+
+      "request_changes" ->
+        handle_autonomous_review_rework(state, handoff, review, :autonomous_review_requested_changes)
+
+      "needs_input" ->
+        report_autonomous_review_needs_input(state, handoff, review, :autonomous_review_needs_input)
+    end
+  end
+
+  defp handle_autonomous_review_rework(state, handoff, review, reason) do
+    _ =
+      Storage.append_event(state.run_id, "warning", "autonomous review requested changes", %{
+        issue_session_id: state.issue_session_id,
+        verdict: review_value(review, :verdict),
+        summary: review_value(review, :summary),
+        output_path: review_value(review, :output_path),
+        reason: inspect(reason)
+      })
+
+    prompt = autonomous_review_feedback_prompt(state.issue, handoff, review, reason)
+    _ = write_autonomous_review_feedback_file(state.workspace, review, reason)
+    _ = remove_handoff_marker(state)
+    {:continue_with_prompt, state, prompt}
+  end
+
+  defp autonomous_review_feedback_prompt(%Issue{} = issue, handoff, review, reason) do
+    """
+    Autonomous PR review feedback:
+
+    - Issue: #{issue.identifier || issue.id} — #{issue.title}
+    - PR URL, if known: #{issue.pr_url || Map.get(handoff, :pr_url) || "unknown"}
+    - Verdict: #{review_value(review, :verdict) || "request_changes"}
+    - Summary: #{review_value(review, :summary) || inspect(reason)}
+
+    The independent autonomous reviewer requested changes before the issue could park at human-review.
+    Continue in this same durable executor thread. Inspect `.symphony/autonomous-reviews/review-feedback.md`, the PR diff, checks, comments, and the issue acceptance criteria. Fix the implementation or evidence as needed.
+
+    When the PR is genuinely ready again, push the branch if needed and write a fresh `.symphony/handoff.json` with `ready: true`, `state: "human-review"`, `pr_url`, and current validation/evidence metadata.
+    """
+  end
+
+  defp write_autonomous_review_feedback_file(workspace, review, reason) when is_binary(workspace) do
+    feedback_path = Path.join([workspace, ".symphony", "autonomous-reviews", "review-feedback.md"])
+
+    :ok = File.mkdir_p(Path.dirname(feedback_path))
+
+    File.write(feedback_path, """
+    # Symphony Autonomous PR Review
+
+    The PR-ready handoff did not pass autonomous review.
+
+    Summary:
+    #{review_value(review, :summary) || inspect(reason)}
+
+    Raw review:
+    ```json
+    #{Jason.encode!(review, pretty: true)}
+    ```
+    """)
+  end
+
+  defp report_autonomous_review_needs_input(%{issue: %Issue{id: issue_id}} = state, handoff, review, reason)
+       when is_binary(issue_id) do
+    _ =
+      Storage.append_event(state.run_id, "warning", "autonomous review needs input", %{
+        issue_session_id: state.issue_session_id,
+        verdict: review_value(review, :verdict) || "needs_input",
+        summary: review_value(review, :summary),
+        output_path: review_value(review, :output_path),
+        reason: inspect(reason)
+      })
+
+    comment =
+      autonomous_review_needs_input_comment(state, handoff, review, reason)
+
+    comment_result = Tracker.create_comment(issue_id, comment)
+    state_result = Tracker.update_issue_state(issue_id, "Needs Input")
+
+    case {comment_result, state_result} do
+      {:ok, :ok} ->
+        refreshed_issue =
+          case fetch_single_issue_state(state) do
+            {:ok, issue} -> issue
+            _ -> %{state.issue | state: "Needs Input"}
+          end
+
+        {:stop, %{state | issue: refreshed_issue}, :needs_input}
+
+      {comment_error, state_error} ->
+        errors = %{comment_result: comment_error, state_result: state_error}
+
+        {:error, {:autonomous_review_needs_input_report_failed, errors}}
+    end
+  end
+
+  defp autonomous_review_needs_input_comment(state, handoff, review, reason) do
+    """
+    ## Symphony autonomous review needs input
+
+    Symphony kept this executor session autonomous through PR handoff, but the autonomous PR review could not produce a passing verdict.
+
+    - Issue: `#{state.issue.identifier || state.issue.id}`
+    - Run: `#{state.run_id || "unknown"}`
+    - Issue session: `#{state.issue_session_id || "unknown"}`
+    - Workspace: `#{state.workspace}`
+    - PR: `#{state.issue.pr_url || Map.get(handoff, :pr_url) || "unknown"}`
+    - Review verdict: `#{review_value(review, :verdict) || "needs_input"}`
+    - Summary: #{review_value(review, :summary) || inspect(reason)}
+
+    The issue was moved to `needs-input` so an operator can inspect the workspace, PR, review artifact, and GitHub credentials.
+    """
+  end
+
+  defp issue_with_handoff_pr(%Issue{} = issue, handoff) when is_map(handoff) do
+    pr_url = first_present(issue.pr_url, Map.get(handoff, :pr_url))
+
+    %{issue | pr_url: pr_url, pr_number: issue.pr_number || pr_number_from_url(pr_url)}
+  end
+
+  defp reviewable_pr?(%Issue{pr_url: pr_url, pr_number: pr_number}) do
+    (is_binary(pr_url) and String.trim(pr_url) != "") or not is_nil(pr_number)
+  end
+
+  defp pr_number_from_url(pr_url) when is_binary(pr_url) do
+    case Regex.run(~r{/pull/(\d+)(?:\z|[/?#])}, pr_url) do
+      [_match, number] -> String.to_integer(number)
+      _ -> nil
+    end
+  end
+
+  defp pr_number_from_url(_pr_url), do: nil
+
+  defp first_present(left, right) when is_binary(left) do
+    if String.trim(left) == "", do: first_present(nil, right), else: left
+  end
+
+  defp first_present(_left, right) when is_binary(right) do
+    if String.trim(right) == "", do: nil, else: right
+  end
+
+  defp first_present(left, right), do: left || right
+
+  defp review_value(%{} = review, key) do
+    Map.get(review, key) || Map.get(review, Atom.to_string(key))
+  rescue
+    ArgumentError -> Map.get(review, key)
+  end
+
+  defp review_value(_review, _key), do: nil
 
   defp run_blocking_evidence_gate(state, handoff, decision, bundle_id, attempt) do
     case Evidence.load_bundle(state.workspace, decision) do
@@ -754,8 +979,6 @@ defmodule SymphonyElixir.IssueSession do
     File.write(feedback_path, Evidence.feedback_markdown(review, reason))
   end
 
-  defp write_evidence_feedback_file(_workspace, _review, _reason), do: :ok
-
   defp remove_handoff_marker(%{workspace: workspace}) when is_binary(workspace) do
     case File.rm(Handoff.path(workspace)) do
       :ok -> :ok
@@ -784,8 +1007,6 @@ defmodule SymphonyElixir.IssueSession do
     end
   end
 
-  defp report_evidence_needs_input(state, _handoff, _review, reason), do: {:error, {:evidence_review_failed, reason, state.issue}}
-
   defp evidence_needs_input_comment(state, handoff, review, reason) do
     """
     ## Symphony evidence review needs input
@@ -795,7 +1016,7 @@ defmodule SymphonyElixir.IssueSession do
     - Issue: `#{state.issue.identifier || state.issue.id}`
     - Run: `#{state.run_id || "unknown"}`
     - Issue session: `#{state.issue_session_id || "unknown"}`
-    - Workspace: `#{state.workspace || "unknown"}`
+    - Workspace: `#{state.workspace}`
     - PR: `#{state.issue.pr_url || Map.get(handoff, :pr_url) || "unknown"}`
     - Review verdict: `#{Map.get(review, :verdict, "request_changes")}`
     - Summary: #{Map.get(review, :summary) || inspect(reason)}
@@ -863,10 +1084,7 @@ defmodule SymphonyElixir.IssueSession do
   end
 
   defp initial_cycle_kind(opts) do
-    cond do
-      Keyword.has_key?(opts, :restart_capsule) -> :restart
-      true -> :initial
-    end
+    if Keyword.has_key?(opts, :restart_capsule), do: :restart, else: :initial
   end
 
   defp issue_state_fetcher(opts) do
@@ -915,6 +1133,10 @@ defmodule SymphonyElixir.IssueSession do
 
   defp restart_prompt(%Issue{} = issue, opts) do
     capsule = Keyword.get(opts, :restart_capsule, %{})
+    workspace_path = capsule_value(capsule, :workspace_path) || "unknown"
+    pr_url = issue.pr_url || capsule_value(capsule, :pr_url) || "unknown"
+    stop_reason = capsule_value(capsule, :stop_reason) || "unknown"
+    resume_thread_id = Keyword.get(opts, :resume_thread_id) || "unknown"
 
     """
     Symphony restart continuation:
@@ -922,10 +1144,10 @@ defmodule SymphonyElixir.IssueSession do
     - Symphony restarted while this issue session was active or parked.
     - Issue: #{issue.identifier || issue.id} — #{issue.title}
     - Current issue state: #{issue.state}
-    - Workspace: #{Map.get(capsule, :workspace_path) || Map.get(capsule, "workspace_path") || "unknown"}
-    - Prior Codex thread id: #{Keyword.get(opts, :resume_thread_id) || "unknown"}
-    - PR URL, if known: #{issue.pr_url || Map.get(capsule, :pr_url) || Map.get(capsule, "pr_url") || "unknown"}
-    - Prior interruption reason: #{Map.get(capsule, :stop_reason) || Map.get(capsule, "stop_reason") || "unknown"}
+    - Workspace: #{workspace_path}
+    - Prior Codex thread id: #{resume_thread_id}
+    - PR URL, if known: #{pr_url}
+    - Prior interruption reason: #{stop_reason}
 
     Continue from the preserved workspace and restored thread if available.
 
@@ -934,6 +1156,12 @@ defmodule SymphonyElixir.IssueSession do
     Only restart broad discovery when the workspace has no useful artifact or the existing artifact is clearly wrong. Keep working autonomously toward a validated PR-ready handoff unless you are blocked by missing auth/secrets, required human input, or a real product decision the issue cannot answer.
     """
   end
+
+  defp capsule_value(capsule, key) when is_map(capsule) and is_atom(key) do
+    Map.get(capsule, key) || Map.get(capsule, Atom.to_string(key))
+  end
+
+  defp capsule_value(_capsule, _key), do: nil
 
   defp codex_message_handler(recipient, issue) do
     fn message ->
@@ -1080,7 +1308,7 @@ defmodule SymphonyElixir.IssueSession do
 
   defp stop_app_session(state), do: state
 
-  defp record_resume_metadata(%__MODULE__{} = state, %{metadata: metadata}) when is_map(metadata) do
+  defp record_resume_metadata(%__MODULE__{} = state, %{metadata: metadata} = app_session) when is_map(metadata) do
     if Map.get(metadata, :resume_attempted) do
       level = if Map.get(metadata, :resume_succeeded), do: "info", else: "warning"
       message = if Map.get(metadata, :resume_succeeded), do: "codex thread resumed", else: "codex thread resume failed; started new thread"
@@ -1088,7 +1316,7 @@ defmodule SymphonyElixir.IssueSession do
       Storage.append_event(state.run_id, level, message, %{
         issue_session_id: state.issue_session_id,
         requested_thread_id: Keyword.get(state.opts, :resume_thread_id),
-        active_thread_id: Map.get(state.app_session || %{}, :thread_id),
+        active_thread_id: Map.get(app_session, :thread_id),
         resume_failure_reason: Map.get(metadata, :resume_failure_reason)
       })
     end

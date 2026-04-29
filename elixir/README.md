@@ -169,8 +169,12 @@ Notes:
   reviewer verdicts in SQLite and can publish a GitHub check with conclusion `success`,
   `failure`, or `action_required` for `pass`, `request_changes`, or `needs_input`.
 - Symphony refuses pass-style PR approvals unless the configured reviewer token is present and
-  distinct from the builder token. For Symphony-authored PRs, failed autonomous review routes back
-  to the executor/rework path instead of letting the reviewer push fixes to the builder branch.
+  distinct from the builder token. When an independent reviewer token is configured, GitHub
+  human-review handoffs run the autonomous reviewer before parking the durable session. `pass`
+  parks at `human-review`; `request_changes` writes
+  `.symphony/autonomous-reviews/review-feedback.md` and prompts the same executor thread; review
+  infrastructure failures move the issue to `needs-input`. If the reviewer identity is not
+  configured yet, Symphony records a skip event instead of pretending an independent gate ran.
 - `runtime_profile` defaults to `default`. Set `runtime_profile: local_trusted` only for trusted
   local dogfood runs that need Codex workers to push branches, open PRs, and comment on GitHub; it
   runs local Codex sessions with `danger-full-access` so Git handoff is not blocked by sandboxed

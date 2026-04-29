@@ -532,20 +532,31 @@ defmodule SymphonyElixir.Storage do
     );
     """
 
-    with :ok <- exec(path, sql),
-         :ok <- ensure_column(path, "runs", "issue_session_id", "text"),
-         :ok <- ensure_column(path, "runs", "thread_id", "text"),
-         :ok <- ensure_column(path, "runs", "turn_count", "integer"),
-         :ok <- ensure_column(path, "runs", "session_state", "text"),
-         :ok <- ensure_column(path, "runs", "health_json", "text"),
-         :ok <- ensure_column(path, "runs", "pr_state", "text"),
-         :ok <- ensure_column(path, "runs", "check_state", "text"),
-         :ok <- ensure_column(path, "runs", "review_state", "text"),
-         :ok <- ensure_column(path, "issue_snapshots", "pr_state", "text"),
-         :ok <- ensure_column(path, "issue_snapshots", "check_state", "text"),
-         :ok <- ensure_column(path, "issue_snapshots", "review_state", "text") do
-      :ok
+    with :ok <- exec(path, sql) do
+      ensure_migration_columns(path)
     end
+  end
+
+  defp ensure_migration_columns(path) do
+    [
+      {"runs", "issue_session_id", "text"},
+      {"runs", "thread_id", "text"},
+      {"runs", "turn_count", "integer"},
+      {"runs", "session_state", "text"},
+      {"runs", "health_json", "text"},
+      {"runs", "pr_state", "text"},
+      {"runs", "check_state", "text"},
+      {"runs", "review_state", "text"},
+      {"issue_snapshots", "pr_state", "text"},
+      {"issue_snapshots", "check_state", "text"},
+      {"issue_snapshots", "review_state", "text"}
+    ]
+    |> Enum.reduce_while(:ok, fn {table, column, type}, :ok ->
+      case ensure_column(path, table, column, type) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp do_upsert_repo(path, attrs) do
@@ -684,23 +695,32 @@ defmodule SymphonyElixir.Storage do
       [_ | _] ->
         now = timestamp()
 
-        case exec(
-               path,
-               "update runs set state = 'cancelled', error = #{sql_quote(reason)}, updated_at = #{sql_quote(now)} where state = 'running';"
-             ) do
-          :ok ->
-            Enum.each(run_ids, fn run_id ->
-              _ =
-                do_append_event(path, run_id, "warning", "startup recovery marked run interrupted", %{
-                  reason: reason
-                })
-            end)
+        interrupt_running_run_records(path, run_ids, reason, now)
+    end
+  end
 
-            {:ok, length(run_ids)}
+  defp interrupt_running_run_records(path, run_ids, reason, now) do
+    sql = """
+    update runs set
+      state = 'cancelled',
+      error = #{sql_quote(reason)},
+      updated_at = #{sql_quote(now)}
+    where state = 'running';
+    """
 
-          {:error, reason} ->
-            {:error, reason}
-        end
+    case exec(path, sql) do
+      :ok ->
+        Enum.each(run_ids, fn run_id ->
+          _ =
+            do_append_event(path, run_id, "warning", "startup recovery marked run interrupted", %{
+              reason: reason
+            })
+        end)
+
+        {:ok, length(run_ids)}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

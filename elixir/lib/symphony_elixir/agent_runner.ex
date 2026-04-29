@@ -225,8 +225,6 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp artifact_nudge_capsule_prompt(_nudge), do: ""
-
   defp continuation_capsule_body(%{} = continuation) do
     [
       continuation_issue_line(Map.get(continuation, "issue")),

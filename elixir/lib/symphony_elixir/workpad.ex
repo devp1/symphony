@@ -48,25 +48,23 @@ defmodule SymphonyElixir.Workpad do
   def fingerprint(workspace) when is_binary(workspace) do
     workpad_path = path(workspace)
 
-    if File.regular?(workpad_path) do
-      case File.read(workpad_path) do
-        {:ok, content} ->
-          trimmed_content = String.trim(content)
-
-          if trimmed_content == "" do
-            :missing
-          else
-            {:ok, :erlang.phash2(trimmed_content)}
-          end
-
-        {:error, _reason} ->
-          :missing
-      end
-    else
-      :missing
-    end
+    if File.regular?(workpad_path), do: fingerprint_file(workpad_path), else: :missing
   rescue
     _ -> :missing
+  end
+
+  defp fingerprint_file(workpad_path) do
+    case File.read(workpad_path) do
+      {:ok, content} -> fingerprint_content(content)
+      {:error, _reason} -> :missing
+    end
+  end
+
+  defp fingerprint_content(content) when is_binary(content) do
+    case String.trim(content) do
+      "" -> :missing
+      trimmed_content -> {:ok, :erlang.phash2(trimmed_content)}
+    end
   end
 
   defp ensure_local_workspace(workspace) do

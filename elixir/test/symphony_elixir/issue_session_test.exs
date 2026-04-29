@@ -212,6 +212,317 @@ defmodule SymphonyElixir.IssueSessionTest do
     end
   end
 
+  test "durable issue session runs autonomous PR review before human-review parking" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-issue-session-autonomous-review-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(test_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-autonomous-review"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-autonomous-review"}}}'
+            mkdir -p .symphony
+            printf '%s\\n' '{"ready":true,"state":"human-review","reason":"pr-ready","pr_url":"https://github.com/devp1/Beacon/pull/25"}' > .symphony/handoff.json
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "github",
+        tracker_owner: "devp1",
+        tracker_repo: "Beacon",
+        github_builder_token: "builder-token",
+        github_reviewer_token: "reviewer-token",
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      parent = self()
+
+      Application.put_env(:symphony_elixir, :github_command_fun, fn args, env ->
+        send(parent, {:gh_args, args, env})
+        {"{}", 0}
+      end)
+
+      issue = %Issue{
+        id: "25",
+        identifier: "GH-25",
+        title: "Autonomous review handoff",
+        description: "The worker opened a review-ready PR.",
+        state: "In Progress",
+        url: "https://github.com/devp1/Beacon/issues/25",
+        repo_id: "github",
+        repo_owner: "devp1",
+        repo_name: "Beacon",
+        number: 25,
+        head_sha: "abc123",
+        labels: []
+      }
+
+      issue_state_fetcher = fn [_issue_id] ->
+        {:ok, [%{issue | state: "Human Review", pr_url: "https://github.com/devp1/Beacon/pull/25"}]}
+      end
+
+      assert {:ok, "issue-session-autonomous-review"} =
+               SymphonyElixir.Storage.start_issue_session(%{
+                 id: "issue-session-autonomous-review",
+                 issue_identifier: issue.identifier,
+                 state: "running",
+                 current_run_id: "run-autonomous-review"
+               })
+
+      assert {:ok, "run-autonomous-review"} =
+               SymphonyElixir.Storage.start_run(%{
+                 id: "run-autonomous-review",
+                 issue_identifier: issue.identifier,
+                 issue_session_id: "issue-session-autonomous-review",
+                 state: "running",
+                 session_state: "running"
+               })
+
+      assert {:ok, _pid} =
+               IssueSession.start_link(
+                 issue: issue,
+                 recipient: self(),
+                 issue_session_id: "issue-session-autonomous-review",
+                 run_id: "run-autonomous-review",
+                 issue_state_fetcher: issue_state_fetcher,
+                 autonomous_review_runner: fn _workspace, review_issue ->
+                   send(parent, {:autonomous_review_runner, review_issue.pr_url, review_issue.pr_number})
+
+                   {:ok,
+                    %{
+                      verdict: "pass",
+                      summary: "autonomous review accepted the PR",
+                      head_sha: "abc123",
+                      output_path: ".symphony/autonomous-reviews/review.json"
+                    }}
+                 end
+               )
+
+      assert_receive {:autonomous_review_runner, "https://github.com/devp1/Beacon/pull/25", 25}, 5_000
+
+      assert_receive {:issue_session_state, "25", %{session_state: :parked, health: ["parked"], stop_reason: "human_review"}}, 5_000
+
+      assert_received {:gh_args, ["api", "repos/devp1/Beacon/issues/25" | _], _env}
+
+      stored_run = SymphonyElixir.Storage.get_run("run-autonomous-review")
+      assert stored_run["state"] == "parked"
+      assert Enum.any?(stored_run["events"], &(&1["message"] == "autonomous review passed"))
+      assert Enum.any?(stored_run["events"], &(&1["message"] == "worker handoff state verified"))
+    after
+      Application.delete_env(:symphony_elixir, :github_command_fun)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "durable issue session routes autonomous review changes back to same executor thread" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-issue-session-autonomous-review-rework-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(test_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/symphony-autonomous-review-rework.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-autonomous-review-rework"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-autonomous-review-rework-1"}}}'
+            mkdir -p .symphony
+            printf '%s\\n' '{"ready":true,"state":"human-review","reason":"pr-ready","pr_url":"https://github.com/devp1/Beacon/pull/26"}' > .symphony/handoff.json
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-autonomous-review-rework-2"}}}'
+            mkdir -p .symphony
+            printf '%s\\n' '{"ready":true,"state":"human-review","reason":"review-fixed","pr_url":"https://github.com/devp1/Beacon/pull/26"}' > .symphony/handoff.json
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "github",
+        tracker_owner: "devp1",
+        tracker_repo: "Beacon",
+        github_builder_token: "builder-token",
+        github_reviewer_token: "reviewer-token",
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      parent = self()
+      {:ok, review_attempts} = Agent.start_link(fn -> 0 end)
+
+      Application.put_env(:symphony_elixir, :github_command_fun, fn args, env ->
+        send(parent, {:gh_args, args, env})
+        {"{}", 0}
+      end)
+
+      issue = %Issue{
+        id: "26",
+        identifier: "GH-26",
+        title: "Autonomous review rework",
+        description: "The worker should address autonomous review feedback in the same thread.",
+        state: "In Progress",
+        url: "https://github.com/devp1/Beacon/issues/26",
+        repo_id: "github",
+        repo_owner: "devp1",
+        repo_name: "Beacon",
+        number: 26,
+        head_sha: "def456",
+        labels: []
+      }
+
+      issue_state_fetcher = fn [_issue_id] ->
+        {:ok, [%{issue | state: "Human Review", pr_url: "https://github.com/devp1/Beacon/pull/26"}]}
+      end
+
+      assert {:ok, "issue-session-autonomous-review-rework"} =
+               SymphonyElixir.Storage.start_issue_session(%{
+                 id: "issue-session-autonomous-review-rework",
+                 issue_identifier: issue.identifier,
+                 state: "running",
+                 current_run_id: "run-autonomous-review-rework"
+               })
+
+      assert {:ok, "run-autonomous-review-rework"} =
+               SymphonyElixir.Storage.start_run(%{
+                 id: "run-autonomous-review-rework",
+                 issue_identifier: issue.identifier,
+                 issue_session_id: "issue-session-autonomous-review-rework",
+                 state: "running",
+                 session_state: "running"
+               })
+
+      assert {:ok, _pid} =
+               IssueSession.start_link(
+                 issue: issue,
+                 recipient: self(),
+                 issue_session_id: "issue-session-autonomous-review-rework",
+                 run_id: "run-autonomous-review-rework",
+                 issue_state_fetcher: issue_state_fetcher,
+                 autonomous_review_runner: fn _workspace, _review_issue ->
+                   attempt = Agent.get_and_update(review_attempts, fn attempt -> {attempt + 1, attempt + 1} end)
+                   send(parent, {:autonomous_review_attempt, attempt})
+
+                   if attempt == 1 do
+                     {:ok,
+                      %{
+                        verdict: "request_changes",
+                        summary: "Fix the unchecked edge case",
+                        head_sha: "def456",
+                        findings: [%{title: "Unchecked edge case", body: "Add the missing guard."}]
+                      }}
+                   else
+                     {:ok,
+                      %{
+                        verdict: "pass",
+                        summary: "review feedback addressed",
+                        head_sha: "def456"
+                      }}
+                   end
+                 end
+               )
+
+      assert_receive {:autonomous_review_attempt, 1}, 5_000
+      assert_receive {:autonomous_review_attempt, 2}, 5_000
+
+      assert_receive {:issue_session_state, "26", %{session_state: :parked, health: ["parked"], stop_reason: "human_review"}}, 5_000
+
+      stored_run = SymphonyElixir.Storage.get_run("run-autonomous-review-rework")
+      assert stored_run["state"] == "parked"
+      assert Enum.any?(stored_run["events"], &(&1["message"] == "autonomous review requested changes"))
+      assert Enum.any?(stored_run["events"], &(&1["message"] == "autonomous review passed"))
+
+      feedback_path =
+        Path.join([
+          workspace_root,
+          "GH-26",
+          ".symphony",
+          "autonomous-reviews",
+          "review-feedback.md"
+        ])
+
+      assert File.read!(feedback_path) =~ "Fix the unchecked edge case"
+
+      turn_texts =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.filter(&(&1["method"] == "turn/start"))
+        |> Enum.map(fn payload ->
+          get_in(payload, ["params", "input"])
+          |> Enum.map_join("\n", &Map.get(&1, "text", ""))
+        end)
+
+      assert length(turn_texts) == 2
+      assert Enum.at(turn_texts, 1) =~ "Autonomous PR review feedback:"
+      assert Enum.at(turn_texts, 1) =~ "write a fresh `.symphony/handoff.json`"
+    after
+      Application.delete_env(:symphony_elixir, :github_command_fun)
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
   test "durable issue session applies ready startup handoff before starting Codex" do
     test_root =
       Path.join(

@@ -8,8 +8,16 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, IssueSession, RunLedger, StatusDashboard, Storage, Tracker, Workpad, Workspace}
+  alias SymphonyElixir.AgentRunner
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.IssueSession
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.RunLedger
+  alias SymphonyElixir.StatusDashboard
+  alias SymphonyElixir.Storage
+  alias SymphonyElixir.Tracker
+  alias SymphonyElixir.Workpad
+  alias SymphonyElixir.Workspace
 
   @continuation_retry_delay_ms 1_000
   @artifact_nudge_retry_delay_ms 1_000
@@ -559,40 +567,59 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_resume_parked_issue_session(%State{} = state, %Issue{} = issue) do
     case Map.get(state.running, issue.id) do
       %{session_kind: :durable, session_state: :parked, pid: pid} = running_entry when is_pid(pid) ->
-        worker_host = Map.get(running_entry, :worker_host)
-
-        if dispatch_slots_available?(issue, state) and worker_slots_available?(state, worker_host) do
-          run_id = create_run_record(issue, worker_host, Map.get(running_entry, :issue_session_id))
-          opts = agent_runner_opts(next_retry_attempt_from_running(running_entry), worker_host, run_resume_agent_opts(running_entry, run_id))
-
-          case IssueSession.resume(pid, issue, opts) do
-            :ok ->
-              Logger.info("Resumed parked durable issue session for #{issue_context(issue)} run_id=#{run_id}")
-
-              updated_entry =
-                running_entry
-                |> Map.merge(%{
-                  issue: issue,
-                  run_id: run_id,
-                  session_state: :running,
-                  health: ["healthy"],
-                  stop_reason: nil,
-                  parked_at: nil
-                })
-
-              %{state | running: Map.put(state.running, issue.id, updated_entry)}
-
-            {:error, reason} ->
-              Logger.warning("Unable to resume parked durable issue session for #{issue_context(issue)}: #{inspect(reason)}")
-              state
-          end
-        else
-          state
-        end
+        resume_parked_issue_session(state, issue, running_entry, pid)
 
       _ ->
         state
     end
+  end
+
+  defp resume_parked_issue_session(state, issue, running_entry, pid) do
+    worker_host = Map.get(running_entry, :worker_host)
+
+    if dispatch_slots_available?(issue, state) and worker_slots_available?(state, worker_host) do
+      do_resume_parked_issue_session(state, issue, running_entry, pid, worker_host)
+    else
+      state
+    end
+  end
+
+  defp do_resume_parked_issue_session(state, issue, running_entry, pid, worker_host) do
+    run_id = create_run_record(issue, worker_host, Map.get(running_entry, :issue_session_id))
+
+    opts =
+      agent_runner_opts(
+        next_retry_attempt_from_running(running_entry),
+        worker_host,
+        run_resume_agent_opts(running_entry, run_id)
+      )
+
+    case IssueSession.resume(pid, issue, opts) do
+      :ok -> resumed_issue_session_state(state, issue, running_entry, run_id)
+      {:error, reason} -> failed_resume_parked_issue_session(state, issue, reason)
+    end
+  end
+
+  defp resumed_issue_session_state(state, issue, running_entry, run_id) do
+    Logger.info("Resumed parked durable issue session for #{issue_context(issue)} run_id=#{run_id}")
+
+    updated_entry =
+      running_entry
+      |> Map.merge(%{
+        issue: issue,
+        run_id: run_id,
+        session_state: :running,
+        health: ["healthy"],
+        stop_reason: nil,
+        parked_at: nil
+      })
+
+    %{state | running: Map.put(state.running, issue.id, updated_entry)}
+  end
+
+  defp failed_resume_parked_issue_session(state, issue, reason) do
+    Logger.warning("Unable to resume parked durable issue session for #{issue_context(issue)}: #{inspect(reason)}")
+    state
   end
 
   defp park_durable_issue_session(%State{} = state, %Issue{} = issue) do
@@ -714,29 +741,35 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_artifact_watchdog_running_issues(%State{} = state) do
     settings = Config.settings!()
 
-    cond do
-      map_size(state.running) == 0 ->
+    if map_size(state.running) == 0 do
+      state
+    else
+      reconcile_running_entries(state, settings)
+    end
+  end
+
+  defp reconcile_running_entries(state, settings) do
+    state.running
+    |> Map.keys()
+    |> Enum.reduce(state, fn issue_id, state_acc ->
+      reconcile_running_entry(state_acc, issue_id, settings)
+    end)
+  end
+
+  defp reconcile_running_entry(state, issue_id, settings) do
+    case Map.get(state.running, issue_id) do
+      nil ->
         state
 
-      true ->
-        state.running
-        |> Map.keys()
-        |> Enum.reduce(state, fn issue_id, state_acc ->
-          case Map.get(state_acc.running, issue_id) do
-            nil ->
-              state_acc
+      %{session_state: :parked} ->
+        state
 
-            %{session_state: :parked} ->
-              state_acc
-
-            running_entry ->
-              state_acc
-              |> refresh_local_workspace_artifact(issue_id, running_entry)
-              |> refresh_tracker_artifact(issue_id)
-              |> maybe_nudge_unproductive_issue(issue_id, settings)
-              |> maybe_pause_unproductive_issue(issue_id, settings)
-          end
-        end)
+      running_entry ->
+        state
+        |> refresh_local_workspace_artifact(issue_id, running_entry)
+        |> refresh_tracker_artifact(issue_id)
+        |> maybe_nudge_unproductive_issue(issue_id, settings)
+        |> maybe_pause_unproductive_issue(issue_id, settings)
     end
   end
 
@@ -764,19 +797,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp local_workspace_artifact_fingerprint(%{worker_host: worker_host, workspace_path: workspace})
        when is_nil(worker_host) and is_binary(workspace) do
     if File.dir?(workspace) do
-      case local_git_status_artifact_fingerprint(workspace) do
-        {:artifact, _reason, _fingerprint} = artifact ->
-          artifact
-
-        :clean ->
-          case Workpad.fingerprint(workspace) do
-            {:ok, fingerprint} ->
-              {:artifact, "symphony workpad updated", {:workpad, fingerprint}}
-
-            :missing ->
-              :clean
-          end
-      end
+      local_workspace_fingerprint_from_files(workspace)
     else
       :clean
     end
@@ -785,6 +806,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp local_workspace_artifact_fingerprint(_running_entry), do: :clean
+
+  defp local_workspace_fingerprint_from_files(workspace) do
+    case local_git_status_artifact_fingerprint(workspace) do
+      {:artifact, _reason, _fingerprint} = artifact -> artifact
+      :clean -> workpad_artifact_fingerprint(workspace)
+    end
+  end
+
+  defp workpad_artifact_fingerprint(workspace) do
+    case Workpad.fingerprint(workspace) do
+      {:ok, fingerprint} -> {:artifact, "symphony workpad updated", {:workpad, fingerprint}}
+      :missing -> :clean
+    end
+  end
 
   defp maybe_restore_artifact_nudge_state_from_workspace(running_entry, %State{} = state, issue_id) do
     restored_count = local_artifact_nudge_count_from_capsule(running_entry)
@@ -926,37 +961,64 @@ defmodule SymphonyElixir.Orchestrator do
         threshold = settings.agent.artifact_nudge_tokens
         max_nudges = settings.agent.max_artifact_nudges
         nudge_count = artifact_nudge_count(state, issue_id, running_entry)
-        tokens_without_repo_artifact = tokens_without_repo_artifact(running_entry)
+        maybe_nudge_running_entry(state, issue_id, running_entry, settings, threshold, max_nudges, nudge_count)
+    end
+  end
 
-        if handoff_progress_recent?(running_entry, settings) do
-          state
-        else
-          if artifact_nudge_enabled?(threshold, max_nudges, nudge_count) and
-               tokens_without_repo_artifact > threshold do
-            if durable_session_entry?(running_entry) do
-              record_session_health_warning(
-                state,
-                issue_id,
-                running_entry,
-                "stale-proof",
-                "artifact nudge threshold exceeded",
-                tokens_without_repo_artifact,
-                threshold
-              )
-            else
-              restart_for_artifact_nudge(
-                state,
-                issue_id,
-                running_entry,
-                tokens_without_repo_artifact,
-                threshold,
-                nudge_count
-              )
-            end
-          else
-            state
-          end
-        end
+  defp maybe_nudge_running_entry(state, issue_id, running_entry, settings, threshold, max_nudges, nudge_count) do
+    if handoff_progress_recent?(running_entry, settings) do
+      state
+    else
+      tokens_without_repo_artifact = tokens_without_repo_artifact(running_entry)
+
+      maybe_apply_artifact_nudge(
+        state,
+        issue_id,
+        running_entry,
+        tokens_without_repo_artifact,
+        threshold,
+        max_nudges,
+        nudge_count
+      )
+    end
+  end
+
+  defp maybe_apply_artifact_nudge(
+         state,
+         issue_id,
+         running_entry,
+         tokens_without_repo_artifact,
+         threshold,
+         max_nudges,
+         nudge_count
+       ) do
+    if artifact_nudge_enabled?(threshold, max_nudges, nudge_count) and tokens_without_repo_artifact > threshold do
+      apply_artifact_nudge(state, issue_id, running_entry, tokens_without_repo_artifact, threshold, nudge_count)
+    else
+      state
+    end
+  end
+
+  defp apply_artifact_nudge(state, issue_id, running_entry, tokens_without_repo_artifact, threshold, nudge_count) do
+    if durable_session_entry?(running_entry) do
+      record_session_health_warning(
+        state,
+        issue_id,
+        running_entry,
+        "stale-proof",
+        "artifact nudge threshold exceeded",
+        tokens_without_repo_artifact,
+        threshold
+      )
+    else
+      restart_for_artifact_nudge(
+        state,
+        issue_id,
+        running_entry,
+        tokens_without_repo_artifact,
+        threshold,
+        nudge_count
+      )
     end
   end
 
@@ -1179,32 +1241,43 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         running_entry = Map.put(running_entry, :artifact_nudge_count, artifact_nudge_count(state, issue_id, running_entry))
+        maybe_pause_running_entry(state, issue_id, running_entry, settings)
+    end
+  end
 
-        case artifact_watchdog_budget(running_entry, settings) do
-          {:enabled, watchdog_kind, threshold} ->
-            tokens_without_artifact = artifact_watchdog_tokens_without_artifact(running_entry, watchdog_kind)
+  defp maybe_pause_running_entry(state, issue_id, running_entry, settings) do
+    case artifact_watchdog_budget(running_entry, settings) do
+      {:enabled, watchdog_kind, threshold} ->
+        maybe_apply_artifact_watchdog(state, issue_id, running_entry, watchdog_kind, threshold)
 
-            if tokens_without_artifact > threshold do
-              if durable_session_entry?(running_entry) do
-                record_session_health_warning(
-                  state,
-                  issue_id,
-                  running_entry,
-                  "high-token-no-proof",
-                  artifact_watchdog_label(watchdog_kind),
-                  tokens_without_artifact,
-                  threshold
-                )
-              else
-                pause_unproductive_issue(state, issue_id, running_entry, tokens_without_artifact, threshold, watchdog_kind)
-              end
-            else
-              state
-            end
+      :disabled ->
+        state
+    end
+  end
 
-          :disabled ->
-            state
-        end
+  defp maybe_apply_artifact_watchdog(state, issue_id, running_entry, watchdog_kind, threshold) do
+    tokens_without_artifact = artifact_watchdog_tokens_without_artifact(running_entry, watchdog_kind)
+
+    if tokens_without_artifact > threshold do
+      apply_artifact_watchdog(state, issue_id, running_entry, watchdog_kind, tokens_without_artifact, threshold)
+    else
+      state
+    end
+  end
+
+  defp apply_artifact_watchdog(state, issue_id, running_entry, watchdog_kind, tokens_without_artifact, threshold) do
+    if durable_session_entry?(running_entry) do
+      record_session_health_warning(
+        state,
+        issue_id,
+        running_entry,
+        "high-token-no-proof",
+        artifact_watchdog_label(watchdog_kind),
+        tokens_without_artifact,
+        threshold
+      )
+    else
+      pause_unproductive_issue(state, issue_id, running_entry, tokens_without_artifact, threshold, watchdog_kind)
     end
   end
 
@@ -1217,12 +1290,16 @@ defmodule SymphonyElixir.Orchestrator do
           budget
 
         :disabled ->
-          if first_artifact_seen?(running_entry) do
-            standard_artifact_budget(settings)
-          else
-            first_artifact_budget(settings)
-          end
+          artifact_budget_after_nudge(running_entry, settings)
       end
+    end
+  end
+
+  defp artifact_budget_after_nudge(running_entry, settings) do
+    if first_artifact_seen?(running_entry) do
+      standard_artifact_budget(settings)
+    else
+      first_artifact_budget(settings)
     end
   end
 
@@ -1265,8 +1342,6 @@ defmodule SymphonyElixir.Orchestrator do
     Map.get(running_entry, :last_artifact_reason) not in [nil, "run started"]
   end
 
-  defp first_artifact_seen?(_running_entry), do: false
-
   defp artifact_watchdog_tokens_without_artifact(running_entry, :repo_artifact_nudge_exhausted) do
     tokens_without_repo_artifact(running_entry)
   end
@@ -1281,8 +1356,6 @@ defmodule SymphonyElixir.Orchestrator do
     handoff_progress_candidate?(running_entry) and is_integer(threshold) and threshold > 0 and
       handoff_progress_seen?(running_entry) and tokens_without_handoff_progress(running_entry) <= threshold
   end
-
-  defp handoff_progress_recent?(_running_entry, _settings), do: false
 
   defp handoff_progress_threshold(settings) do
     [
@@ -1306,8 +1379,6 @@ defmodule SymphonyElixir.Orchestrator do
       repo_artifact_fingerprint?(Map.get(running_entry, :last_codex_diff_artifact_fingerprint))
   end
 
-  defp handoff_progress_candidate?(_running_entry), do: false
-
   defp repo_artifact_fingerprint?({:git_status, _fingerprint}), do: true
   defp repo_artifact_fingerprint?({:codex_diff, _fingerprint}), do: true
   defp repo_artifact_fingerprint?(_fingerprint), do: false
@@ -1322,8 +1393,6 @@ defmodule SymphonyElixir.Orchestrator do
       0
     end
   end
-
-  defp tokens_without_handoff_progress(_running_entry), do: 0
 
   defp pause_unproductive_issue(state, issue_id, running_entry, tokens_without_artifact, threshold, watchdog_kind) do
     identifier = Map.get(running_entry, :identifier, issue_id)
@@ -1358,7 +1427,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp artifact_watchdog_label(:first_artifact), do: "first-artifact watchdog"
   defp artifact_watchdog_label(:repo_artifact_nudge_exhausted), do: "artifact nudge watchdog"
-  defp artifact_watchdog_label(_watchdog_kind), do: "artifact watchdog"
+  defp artifact_watchdog_label(:standard_artifact), do: "artifact watchdog"
 
   defp tokens_without_artifact(running_entry) when is_map(running_entry) do
     total = Map.get(running_entry, :codex_total_tokens, 0)
@@ -1371,8 +1440,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp tokens_without_artifact(_running_entry), do: 0
-
   defp tokens_without_repo_artifact(running_entry) when is_map(running_entry) do
     total = Map.get(running_entry, :codex_total_tokens, 0)
     baseline = Map.get(running_entry, :repo_artifact_baseline_total_tokens, 0)
@@ -1383,8 +1450,6 @@ defmodule SymphonyElixir.Orchestrator do
       0
     end
   end
-
-  defp tokens_without_repo_artifact(_running_entry), do: 0
 
   defp reset_artifact_progress(%State{} = state, issue_id, reason, timestamp, attrs, opts \\ [])
        when is_binary(issue_id) and is_binary(reason) do
@@ -1498,18 +1563,29 @@ defmodule SymphonyElixir.Orchestrator do
     """
   end
 
-  defp artifact_watchdog_explanation(:first_artifact),
-    do: "it exceeded the first-artifact budget before producing inspectable repo proof"
+  defp artifact_watchdog_explanation(watchdog_kind) do
+    Map.get(
+      %{
+        first_artifact: "it exceeded the first-artifact budget before producing inspectable repo proof",
+        repo_artifact_nudge_exhausted: "it exhausted its artifact nudge budget without producing new inspectable repo proof",
+        standard_artifact: "it spent too many tokens without producing a new inspectable artifact"
+      },
+      watchdog_kind,
+      "it spent too many tokens without producing a new inspectable artifact"
+    )
+  end
 
-  defp artifact_watchdog_explanation(:repo_artifact_nudge_exhausted),
-    do: "it exhausted its artifact nudge budget without producing new inspectable repo proof"
-
-  defp artifact_watchdog_explanation(_watchdog_kind),
-    do: "it spent too many tokens without producing a new inspectable artifact"
-
-  defp artifact_watchdog_comment_kind(:first_artifact), do: "first-artifact"
-  defp artifact_watchdog_comment_kind(:repo_artifact_nudge_exhausted), do: "artifact-nudge"
-  defp artifact_watchdog_comment_kind(_watchdog_kind), do: "standard"
+  defp artifact_watchdog_comment_kind(watchdog_kind) do
+    Map.get(
+      %{
+        first_artifact: "first-artifact",
+        repo_artifact_nudge_exhausted: "artifact-nudge",
+        standard_artifact: "standard"
+      },
+      watchdog_kind,
+      "standard"
+    )
+  end
 
   defp last_artifact_summary(running_entry) do
     reason = Map.get(running_entry, :last_artifact_reason, "run started")
@@ -1623,17 +1699,29 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
     parked_resume? = parked_durable_issue_session?(Map.get(running, issue.id))
 
-    candidate_issue?(issue, active_states, terminal_states) and
-      !MapSet.member?(operator_paused_issue_ids, issue.id) and
-      !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
-      (!MapSet.member?(claimed, issue.id) or parked_resume?) and
-      (!Map.has_key?(running, issue.id) or parked_resume?) and
-      available_slots(state) > 0 and
-      state_slots_available?(issue, running) and
-      worker_slots_available?(state)
+    dispatchable_issue_state?(issue, active_states, terminal_states, operator_paused_issue_ids) and
+      dispatchable_claim_state?(issue, running, claimed, parked_resume?) and
+      dispatch_capacity_available?(issue, state, running)
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp dispatchable_issue_state?(issue, active_states, terminal_states, operator_paused_issue_ids) do
+    candidate_issue?(issue, active_states, terminal_states) and
+      !MapSet.member?(operator_paused_issue_ids, issue.id) and
+      !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
+  end
+
+  defp dispatchable_claim_state?(issue, running, claimed, parked_resume?) do
+    (!MapSet.member?(claimed, issue.id) or parked_resume?) and
+      (!Map.has_key?(running, issue.id) or parked_resume?)
+  end
+
+  defp dispatch_capacity_available?(issue, state, running) do
+    available_slots(state) > 0 and
+      state_slots_available?(issue, running) and
+      worker_slots_available?(state)
+  end
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -2211,11 +2299,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp operator_pause_reason(:run_cancelled), do: "operator cancelled run"
   defp operator_pause_reason(:session_stopped), do: "operator stopped issue session"
-  defp operator_pause_reason(reason), do: "operator pause: #{inspect(reason)}"
 
   defp operator_pause_session_state(:run_cancelled), do: "interrupted-resumable"
   defp operator_pause_session_state(:session_stopped), do: "stopped"
-  defp operator_pause_session_state(_reason), do: "interrupted-resumable"
 
   defp operator_pause_comment(%Issue{} = issue, running_entry, reason) do
     """
@@ -2247,8 +2333,12 @@ defmodule SymphonyElixir.Orchestrator do
     delay_type = pick_retry_delay_type(previous_retry, metadata)
     artifact_nudge_count = pick_retry_artifact_nudge_count(previous_retry, metadata)
     artifact_nudge = pick_retry_artifact_nudge(previous_retry, metadata)
-    last_workspace_artifact_fingerprint = pick_retry_value(previous_retry, metadata, :last_workspace_artifact_fingerprint)
-    last_codex_diff_artifact_fingerprint = pick_retry_value(previous_retry, metadata, :last_codex_diff_artifact_fingerprint)
+
+    last_workspace_artifact_fingerprint =
+      pick_retry_value(previous_retry, metadata, :last_workspace_artifact_fingerprint)
+
+    last_codex_diff_artifact_fingerprint =
+      pick_retry_value(previous_retry, metadata, :last_codex_diff_artifact_fingerprint)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -2842,7 +2932,8 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  @spec stop_issue_session(String.t(), String.t() | integer()) :: {:ok, map()} | {:error, :session_not_found | :unavailable}
+  @spec stop_issue_session(String.t(), String.t() | integer()) ::
+          {:ok, map()} | {:error, :session_not_found | :unavailable}
   def stop_issue_session(repo_id, number), do: stop_issue_session(repo_id, number, __MODULE__)
 
   @spec stop_issue_session(String.t(), String.t() | integer(), GenServer.server()) ::
@@ -3115,44 +3206,36 @@ defmodule SymphonyElixir.Orchestrator do
     method = payload_value(payload, "method")
     event = update[:event] || Map.get(update, "event")
     params = payload_value(payload, "params")
+    summary = codex_activity_text(method, event, params)
 
-    summary =
-      cond do
-        method == "item/commandExecution/requestApproval" ->
-          "command approval requested: #{truncate_activity(command_from_params(params) || "unknown command")}"
-
-        method == "item/tool/requestUserInput" ->
-          "tool input requested: #{truncate_activity(question_from_params(params) || "unknown question")}"
-
-        method == "item/tool/call" ->
-          "tool call: #{truncate_activity(tool_name_from_params(params) || "unknown tool")}"
-
-        method == "turn/diff/updated" ->
-          "repo diff updated"
-
-        method == "turn/completed" ->
-          "turn completed"
-
-        is_atom(event) ->
-          event |> Atom.to_string() |> String.replace("_", " ")
-
-        is_binary(event) ->
-          event
-
-        true ->
-          nil
-      end
-
-    if is_nil(summary) do
-      nil
-    else
+    if is_binary(summary) do
       %{
         "event" => event_to_string(event),
         "method" => method,
         "summary" => summary
       }
+    else
+      nil
     end
   end
+
+  defp codex_activity_text("item/commandExecution/requestApproval", _event, params) do
+    "command approval requested: #{truncate_activity(command_from_params(params) || "unknown command")}"
+  end
+
+  defp codex_activity_text("item/tool/requestUserInput", _event, params) do
+    "tool input requested: #{truncate_activity(question_from_params(params) || "unknown question")}"
+  end
+
+  defp codex_activity_text("item/tool/call", _event, params) do
+    "tool call: #{truncate_activity(tool_name_from_params(params) || "unknown tool")}"
+  end
+
+  defp codex_activity_text("turn/diff/updated", _event, _params), do: "repo diff updated"
+  defp codex_activity_text("turn/completed", _event, _params), do: "turn completed"
+  defp codex_activity_text(_method, event, _params) when is_atom(event), do: event |> Atom.to_string() |> String.replace("_", " ")
+  defp codex_activity_text(_method, event, _params) when is_binary(event), do: event
+  defp codex_activity_text(_method, _event, _params), do: nil
 
   defp command_from_params(params) when is_map(params) do
     payload_value(params, "command") ||
@@ -3232,8 +3315,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp codex_diff_artifact_fingerprint(_update), do: :clean
-
   defp normalize_health_flags(flags) do
     non_healthy =
       flags
@@ -3283,8 +3364,6 @@ defmodule SymphonyElixir.Orchestrator do
         :none
     end
   end
-
-  defp handoff_progress_marker(_update), do: :none
 
   defp handoff_progress_from_command_candidates(params) do
     params
@@ -3397,15 +3476,11 @@ defmodule SymphonyElixir.Orchestrator do
       String.match?(command, ~r/\Abundle exec rspec(?:\s|\z)/)
   end
 
-  defp validation_command?(_command), do: false
-
   defp handoff_command?(command) when is_binary(command) do
     String.match?(command, ~r/\Agit (?:status|diff|add|commit|push)(?:\s|\z)/) or
       String.match?(command, ~r/\Agh pr (?:create|edit|view|checks|status)(?:\s|\z)/) or
       String.match?(command, ~r/\Agh issue (?:comment|edit|view)(?:\s|\z)/)
   end
-
-  defp handoff_command?(_command), do: false
 
   defp maybe_clear_artifact_nudge_count_after_repo_artifact(
          %State{} = state,

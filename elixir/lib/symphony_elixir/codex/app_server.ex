@@ -756,8 +756,6 @@ defmodule SymphonyElixir.Codex.AppServer do
       thread_id_from_nested(map_get(params, "item"))
   end
 
-  defp payload_thread_id(_payload), do: nil
-
   defp thread_id_from_nested(%{} = value), do: map_get(value, "id") || map_get(value, "threadId")
   defp thread_id_from_nested(_value), do: nil
 
@@ -795,67 +793,113 @@ defmodule SymphonyElixir.Codex.AppServer do
     if foreign_thread_notification?(payload, activity.thread_id) do
       receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
     else
-      metadata = metadata_from_message(port, payload)
-      {activity, metadata} = mark_semantic_activity(activity, method, payload, metadata)
+      handle_current_thread_method(
+        port,
+        on_message,
+        payload,
+        payload_string,
+        method,
+        tool_executor,
+        auto_approve_requests,
+        activity
+      )
+    end
+  end
 
-      case maybe_handle_approval_request(
-             port,
-             method,
-             payload,
-             payload_string,
-             on_message,
-             metadata,
-             tool_executor,
-             auto_approve_requests
-           ) do
-        :input_required ->
-          emit_message(
-            on_message,
-            :turn_input_required,
-            %{payload: payload, raw: payload_string},
-            metadata
-          )
+  defp handle_current_thread_method(
+         port,
+         on_message,
+         payload,
+         payload_string,
+         method,
+         tool_executor,
+         auto_approve_requests,
+         activity
+       ) do
+    metadata = metadata_from_message(port, payload)
+    {activity, metadata} = mark_semantic_activity(activity, method, payload, metadata)
 
-          {:error, {:turn_input_required, payload}}
+    decision =
+      maybe_handle_approval_request(
+        port,
+        method,
+        payload,
+        payload_string,
+        on_message,
+        metadata,
+        tool_executor,
+        auto_approve_requests
+      )
 
-        :approved ->
-          receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
+    handle_turn_decision(decision, %{
+      port: port,
+      on_message: on_message,
+      payload: payload,
+      payload_string: payload_string,
+      method: method,
+      tool_executor: tool_executor,
+      auto_approve_requests: auto_approve_requests,
+      activity: activity,
+      metadata: metadata
+    })
+  end
 
-        :approval_required ->
-          emit_message(
-            on_message,
-            :approval_required,
-            %{payload: payload, raw: payload_string},
-            metadata
-          )
+  defp handle_turn_decision(:input_required, context) do
+    emit_message(
+      context.on_message,
+      :turn_input_required,
+      %{payload: context.payload, raw: context.payload_string},
+      context.metadata
+    )
 
-          {:error, {:approval_required, payload}}
+    {:error, {:turn_input_required, context.payload}}
+  end
 
-        :unhandled ->
-          if needs_input?(method, payload) do
-            emit_message(
-              on_message,
-              :turn_input_required,
-              %{payload: payload, raw: payload_string},
-              metadata
-            )
+  defp handle_turn_decision(:approved, context) do
+    receive_loop(
+      context.port,
+      context.on_message,
+      "",
+      context.tool_executor,
+      context.auto_approve_requests,
+      context.activity
+    )
+  end
 
-            {:error, {:turn_input_required, payload}}
-          else
-            emit_message(
-              on_message,
-              :notification,
-              %{
-                payload: payload,
-                raw: payload_string
-              },
-              metadata
-            )
+  defp handle_turn_decision(:approval_required, context) do
+    emit_message(
+      context.on_message,
+      :approval_required,
+      %{payload: context.payload, raw: context.payload_string},
+      context.metadata
+    )
 
-            Logger.debug("Codex notification: #{inspect(method)}")
-            receive_loop(port, on_message, "", tool_executor, auto_approve_requests, activity)
-          end
-      end
+    {:error, {:approval_required, context.payload}}
+  end
+
+  defp handle_turn_decision(:unhandled, context), do: handle_unhandled_turn_method(context)
+
+  defp handle_unhandled_turn_method(%{method: method, payload: payload} = context) do
+    if needs_input?(method, payload) do
+      handle_turn_decision(:input_required, context)
+    else
+      emit_message(
+        context.on_message,
+        :notification,
+        %{payload: payload, raw: context.payload_string},
+        context.metadata
+      )
+
+      Logger.debug("Codex notification: #{inspect(method)}")
+
+      receive_loop(
+        context.port,
+        context.on_message,
+        "",
+        context.tool_executor,
+        context.auto_approve_requests,
+        context.activity
+      )
     end
   end
 

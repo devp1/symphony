@@ -1253,7 +1253,7 @@ defmodule SymphonyElixir.CoreTest do
     assert stored_run["thread_id"] == "thread-park"
     assert stored_run["turn_count"] == 2
     assert stored_run["health"] == ["parked"]
-    assert stored_run["error"] == "human_review"
+    assert is_nil(stored_run["error"])
     assert Enum.any?(stored_run["events"], &(&1["message"] == "durable issue session parked"))
   end
 

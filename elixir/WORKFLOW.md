@@ -104,6 +104,8 @@ Soft budget: if the first implementation path is uncertain after a serious targe
 For routine GitHub mutations in this unattended run, use the authenticated `gh` CLI from the shell (`gh issue view/comment/edit`, `gh pr create/view`, `git push`). Do not use GitHub MCP/app connector tools for ordinary comments, labels, or PR handoff; those connector tools can request interactive approval and stall an unattended worker.
 Prefer targeted comment/PR lookup before the first repo artifact; full issue history is fine after a repo artifact exists, or earlier only when it truly changes the implementation path.
 
+PR handoff fast path: once the branch is pushed, the PR is open/updated, the PR links the issue, required validation is recorded, and one bounded feedback/check sweep finds no actionable comments or failing checks, immediately move the issue from `in-progress`/`rework` to `human-review` and stop. Do not reread broad issue history, repo history, old run logs, memory rollups, or extra docs after the PR is already review-ready unless the bounded sweep surfaces a concrete blocker.
+
 Description:
 {% if issue.description %}
 {{ issue.description }}
@@ -279,7 +281,8 @@ Use this only when completion is blocked by missing required tools or missing au
     - Run the full PR feedback sweep protocol.
     - Confirm PR checks are passing (green) after the latest changes.
     - Confirm every required issue-provided validation/test-plan item is explicitly marked complete in the workpad.
-    - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
+    - If there are no PR comments, no review summaries, no inline review comments, and no check runs, treat that as a clean sweep; do not keep polling or expanding context.
+    - Repeat this check-address-verify loop only when the sweep finds actionable comments, failing checks, or required validation gaps.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
 12. Only then remove `in-progress`/`rework` and add `human-review`.
     - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.

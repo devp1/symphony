@@ -11,14 +11,18 @@ defmodule SymphonyElixirWeb.Presenter do
 
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
+        active_running = Enum.reject(snapshot.running, &parked_entry?/1)
+        parked = Enum.filter(snapshot.running, &parked_entry?/1)
+
         %{
           generated_at: generated_at,
           counts: %{
-            running: Enum.count(snapshot.running, &(Map.get(&1, :session_state) != :parked)),
-            parked: Enum.count(snapshot.running, &(Map.get(&1, :session_state) == :parked)),
+            running: length(active_running),
+            parked: length(parked),
             retrying: length(snapshot.retrying)
           },
-          running: Enum.map(snapshot.running, &running_entry_payload/1),
+          running: Enum.map(active_running, &running_entry_payload/1),
+          parked: Enum.map(parked, &running_entry_payload/1),
           issue_sessions: Storage.list_issue_sessions(),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           repos: repos_payload(),
@@ -124,9 +128,13 @@ defmodule SymphonyElixirWeb.Presenter do
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
+  defp issue_status(%{session_state: :parked}, nil), do: "parked"
+  defp issue_status(%{session_state: "parked"}, nil), do: "parked"
   defp issue_status(_running, nil), do: "running"
   defp issue_status(nil, _retry), do: "retrying"
   defp issue_status(_running, _retry), do: "running"
+
+  defp parked_entry?(entry), do: Map.get(entry, :session_state) in [:parked, "parked"]
 
   defp running_entry_payload(entry) do
     %{

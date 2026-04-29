@@ -1070,6 +1070,37 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert plain =~ ~r/No active agents\r?\n│\s*\r?\n├─ Backoff queue/
   end
 
+  test "status dashboard separates parked sessions from active agent count" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [
+           %{
+             identifier: "GH-PARK",
+             state: "Human Review",
+             session_state: :parked,
+             session_id: "thread-park",
+             codex_app_server_pid: "4242",
+             codex_total_tokens: 9_001,
+             runtime_seconds: 75,
+             turn_count: 1,
+             last_codex_event: "turn_completed",
+             last_codex_message: nil
+           }
+         ],
+         retrying: [],
+         codex_totals: %{input_tokens: 10, output_tokens: 2, total_tokens: 12, seconds_running: 75},
+         rate_limits: nil
+       }}
+
+    rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
+    plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
+
+    assert plain =~ "Agents: 0/10 (+1 parked)"
+    assert plain =~ "No active agents"
+    refute plain =~ "GH-PARK"
+  end
+
   test "status dashboard adds a spacer line before backoff queue when agents are active" do
     snapshot_data =
       {:ok,

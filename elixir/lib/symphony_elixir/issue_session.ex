@@ -542,7 +542,7 @@ defmodule SymphonyElixir.IssueSession do
       turn_count: state.turn_count,
       session_state: to_string(session_state),
       health: health,
-      error: stop_reason
+      error: run_error_for_session_state(session_state, stop_reason)
     })
 
     send_session_state_update(state.recipient, state.issue, %{
@@ -622,6 +622,9 @@ defmodule SymphonyElixir.IssueSession do
   defp run_state_for_session_state(:stopped), do: "completed"
   defp run_state_for_session_state(:failed), do: "failed"
   defp run_state_for_session_state(_state), do: "running"
+
+  defp run_error_for_session_state(:failed, stop_reason), do: stop_reason
+  defp run_error_for_session_state(_session_state, _stop_reason), do: nil
 
   defp selected_worker_host(nil, []), do: nil
 

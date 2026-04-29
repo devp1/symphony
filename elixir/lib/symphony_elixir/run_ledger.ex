@@ -146,7 +146,7 @@ defmodule SymphonyElixir.RunLedger do
         turn_count: turn_count,
         session_state: "parked",
         health: health,
-        error: stop_reason
+        error: nil
       }
       |> Map.merge(run_pr_metadata_attrs(Map.get(running_entry, :issue)))
     )

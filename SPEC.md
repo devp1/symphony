@@ -1530,6 +1530,7 @@ Minimum endpoints:
       "generated_at": "2026-02-24T20:15:30Z",
       "counts": {
         "running": 2,
+        "parked": 1,
         "retrying": 1
       },
       "running": [
@@ -1548,6 +1549,16 @@ Minimum endpoints:
             "output_tokens": 800,
             "total_tokens": 2000
           }
+        }
+      ],
+      "parked": [
+        {
+          "issue_id": "ghi789",
+          "issue_identifier": "GH-42",
+          "state": "Human Review",
+          "session_state": "parked",
+          "health": ["parked"],
+          "pr_url": "https://github.com/example/repo/pull/42"
         }
       ],
       "retrying": [

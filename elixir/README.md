@@ -151,6 +151,10 @@ Notes:
   `agent.max_tokens_without_artifact` are advisory health budgets for local trusted durable
   sessions. When crossed, Symphony records `stale-proof` or `high-token-no-proof` warnings in the
   SQLite ledger/API/dashboard, but it does not terminate Codex.
+- These token totals are observability counters, not cost counters. Upstream prompt caching can make
+  repeated input-prefix tokens cheaper and faster, but output/reasoning and dynamic command/GitHub
+  output still represent real runtime and context churn. Large no-artifact or post-handoff token
+  spends should be treated as workflow/prompt issues even when cached input lowers cost.
 - `codex.semantic_inactivity_timeout_ms` defaults to `1800000` (30 minutes). It is the hard
   stuck-run guard for local trusted sessions: Symphony resets it only on meaningful Codex activity
   such as agent message deltas, command output, file-change output, MCP progress, tool calls,
@@ -225,6 +229,8 @@ The cockpit surfaces GitHub PR handoff metadata when available: PR URL, head SHA
 review state. Active run rows include operator controls to request cancellation, rerun an issue, or
 stop a parked/running durable issue session. Those controls call the same JSON API used by tests;
 they are local trusted control-plane actions, not part of the worker prompt.
+Parked durable sessions are shown separately from active runs so `human-review` parking does not look
+like a failing or still-running worker.
 
 ## Project Layout
 

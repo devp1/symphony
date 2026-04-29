@@ -144,6 +144,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">Parked</p>
+            <p class="metric-value numeric"><%= @payload.counts.parked %></p>
+            <p class="metric-detail">Durable sessions waiting at human review or rework.</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -156,6 +162,59 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
             <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
           </article>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Parked sessions</h2>
+              <p class="section-copy">Durable Codex sessions that are paused at review and ready to resume on rework.</p>
+            </div>
+          </div>
+
+          <%= if @payload.parked == [] do %>
+            <p class="empty-state">No parked sessions.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>State</th>
+                    <th>PR</th>
+                    <th>Tokens</th>
+                    <th>Controls</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- @payload.parked}>
+                    <td><span class="issue-id"><%= entry.issue_identifier %></span></td>
+                    <td><span class={state_badge_class(entry.session_state || entry.state)}><%= entry.session_state || entry.state %></span></td>
+                    <td>
+                      <%= if entry.pr_url do %>
+                        <a href={entry.pr_url} target="_blank" rel="noopener noreferrer">PR handoff</a>
+                      <% else %>
+                        <span class="muted">n/a</span>
+                      <% end %>
+                    </td>
+                    <td class="numeric"><%= format_int(entry.tokens.total_tokens) %></td>
+                    <td>
+                      <div class="action-stack">
+                        <%= if entry.repo_id && entry.issue_number do %>
+                          <button type="button" class="subtle-button secondary-action" phx-click="rerun-issue" phx-value-repo-id={entry.repo_id} phx-value-number={entry.issue_number}>
+                            Rerun
+                          </button>
+                          <button type="button" class="subtle-button secondary-action" phx-click="stop-session" phx-value-repo-id={entry.repo_id} phx-value-number={entry.issue_number}>
+                            Stop Session
+                          </button>
+                        <% end %>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
         </section>
 
         <section class="section-card">

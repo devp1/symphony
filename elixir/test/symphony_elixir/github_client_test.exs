@@ -731,6 +731,33 @@ defmodule SymphonyElixir.GitHubClientTest do
                      ]}
   end
 
+  test "update_issue_state treats already closed GitHub issues as done" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon"
+    )
+
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :github_command_fun, fn
+      ["api", "repos/devp1/Beacon/issues/1"] = args ->
+        send(parent, {:gh_args, args})
+        {Jason.encode!(%{"state" => "closed"}), 0}
+
+      args ->
+        send(parent, {:gh_args, args})
+        {"{}", 0}
+    end)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
+
+    assert :ok = GitHubClient.update_issue_state("1", "Done")
+
+    assert_received {:gh_args, ["api", "repos/devp1/Beacon/issues/1"]}
+    refute_received {:gh_args, ["api", "repos/devp1/Beacon/issues/1", "-X", "PATCH", "-f", "state=closed"]}
+  end
+
   defp bearer_jwt_from_args(args) do
     args
     |> Enum.chunk_every(2, 1, :discard)

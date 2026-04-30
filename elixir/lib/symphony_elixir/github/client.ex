@@ -277,9 +277,20 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp close_issue(repo_config, issue_number) do
-    with {:ok, _response} <-
-           gh_api(repo_config, ["repos/#{repo_config.owner}/#{repo_config.name}/issues/#{issue_number}", "-X", "PATCH", "-f", "state=closed"]) do
-      :ok
+    path = "repos/#{repo_config.owner}/#{repo_config.name}/issues/#{issue_number}"
+
+    case gh_api(repo_config, [path]) do
+      {:ok, %{"state" => "closed"}} ->
+        :ok
+
+      {:ok, _issue} ->
+        with {:ok, _response} <-
+               gh_api(repo_config, [path, "-X", "PATCH", "-f", "state=closed"]) do
+          :ok
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

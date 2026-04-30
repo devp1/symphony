@@ -347,6 +347,12 @@ defmodule SymphonyElixir.CoreTest do
     assert "ci-not-green" in reasons
     assert "autonomous-review-stale" in reasons
 
+    assert %{ready?: false, reasons: no_ci_reasons} =
+             SymphonyElixir.AutonomousReview.merge_gate(%{issue | check_state: "none"}, %{verdict: "pass", head_sha: "abc123"})
+
+    assert "ci-not-reported" in no_ci_reasons
+    refute "ci-not-green" in no_ci_reasons
+
     assert {:ok, _review_id} =
              SymphonyElixir.AutonomousReview.record(issue, %{
                run_id: "run-review",

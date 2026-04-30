@@ -175,7 +175,8 @@ defmodule SymphonyElixir.AutonomousReview do
       []
       |> maybe_reason(missing_pr?(issue), "missing-pr")
       |> maybe_reason(issue.pr_state not in [nil, "", "OPEN"], "pr-not-open")
-      |> maybe_reason(issue.check_state != "passing", "ci-not-green")
+      |> maybe_reason(ci_not_reported?(issue.check_state), "ci-not-reported")
+      |> maybe_reason(ci_reported_but_not_green?(issue.check_state), "ci-not-green")
       |> maybe_reason(review_verdict != "pass", "autonomous-review-not-passing")
       |> maybe_reason(review_stale?, "autonomous-review-stale")
 
@@ -223,6 +224,9 @@ defmodule SymphonyElixir.AutonomousReview do
   end
 
   defp snapshot_issue_number(_issue_snapshot), do: nil
+
+  defp ci_not_reported?(check_state), do: check_state in [nil, "", "none"]
+  defp ci_reported_but_not_green?(check_state), do: not ci_not_reported?(check_state) and check_state != "passing"
 
   defp maybe_reason(reasons, true, reason), do: [reason | reasons]
   defp maybe_reason(reasons, _condition, _reason), do: reasons

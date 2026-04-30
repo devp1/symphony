@@ -114,7 +114,8 @@ github:
   builder_token: $SYMPHONY_GITHUB_BUILDER_TOKEN
   reviewer_token: $SYMPHONY_GITHUB_REVIEWER_TOKEN
   review_check_name: symphony/autonomous-review
-  required_check_names: []
+  required_check_names:
+    - ci
 repos:
   - id: beacon
     owner: devp1
@@ -172,6 +173,9 @@ Notes:
 - `github.review_check_name` defaults to `symphony/autonomous-review`. Symphony records autonomous
   reviewer verdicts in SQLite and can publish a GitHub check with conclusion `success`,
   `failure`, or `action_required` for `pass`, `request_changes`, or `needs_input`.
+- `github.required_check_names` names the normal CI checks required for cockpit merge. When it is
+  non-empty, `symphony/autonomous-review` alone is not enough; missing required checks are reported
+  as `ci-not-reported`.
 - Symphony refuses pass-style PR approvals unless the configured reviewer identity is present and
   distinct from the builder identity. When an independent reviewer identity is configured, GitHub
   human-review handoffs run the autonomous reviewer before parking the durable session. `pass`
@@ -298,7 +302,8 @@ The cockpit UI runs on a minimal Phoenix stack:
 The cockpit surfaces GitHub PR handoff metadata when available: PR URL, head SHA, check state, and
 review state. PR-backed issue cards include a local trusted `Merge` action only when the server-side
 merge gate is clear: open PR, green CI, passing autonomous review, and non-stale review head SHA.
-Blocked cards show the exact disabled reasons, and the merge endpoint recomputes the same gate
+Blocked cards show exact disabled reasons like `ci-not-reported`, `ci-not-green`, and
+`autonomous-review-stale`, and the merge endpoint recomputes the same gate
 before issuing any GitHub merge request. Once GitHub accepts the merge, the cockpit immediately
 updates local issue, run, and durable-session state to done/merged so the board does not wait for the
 next poll; closing the GitHub issue is attempted through the builder identity and recorded as part of

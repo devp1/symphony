@@ -660,7 +660,8 @@ not require recognizing or validating extension fields unless that extension is 
   `REVIEWER_GITHUB_*` names are accepted as fallbacks.
 - `github.review_check_name`: string, default `symphony/autonomous-review`
 - `github.required_check_names`: list of strings, default `[]`; named CI checks the cockpit merge
-  gate may require in addition to the autonomous review check
+  gate requires in addition to the autonomous review check. When non-empty, successful
+  `symphony/autonomous-review` alone does not satisfy CI.
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms`: integer, default `30000`
@@ -1775,7 +1776,8 @@ Minimum endpoints:
   - Implementations MUST recompute merge eligibility server-side immediately before issuing any
     GitHub merge request. UI disablement alone is not sufficient.
   - If the gate is blocked, return `409` with a JSON error that includes the blocking reasons, such
-    as `ci-not-green`, `autonomous-review-not-passing`, or `autonomous-review-stale`.
+    as `ci-not-reported`, `ci-not-green`, `autonomous-review-not-passing`, or
+    `autonomous-review-stale`.
   - Local trusted GitHub implementations SHOULD use the builder GitHub identity for the merge and
     SHOULD pin the merge request to the reconciled PR head SHA when available.
   - After GitHub accepts the merge, implementations SHOULD update their local issue snapshot, run

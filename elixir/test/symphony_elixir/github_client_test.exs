@@ -236,6 +236,78 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert failing.check_state == "failing"
   end
 
+  test "linked pull request metadata requires configured CI checks" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_required_check_names: ["ci"]
+    )
+
+    Application.put_env(:symphony_elixir, :github_command_fun, fn
+      [
+        "issue",
+        "view",
+        issue_number,
+        "--repo",
+        "devp1/Beacon",
+        "--json",
+        "closedByPullRequestsReferences"
+      ] ->
+        {Jason.encode!(%{"closedByPullRequestsReferences" => [%{"number" => String.to_integer(issue_number) + 10}]}), 0}
+
+      ["pr", "view", "31", "--repo", "devp1/Beacon", "--json", "url,number,state,headRefOid,statusCheckRollup,reviewDecision"] ->
+        {
+          Jason.encode!(%{
+            "url" => "https://github.com/devp1/Beacon/pull/31",
+            "number" => 31,
+            "state" => "OPEN",
+            "headRefOid" => "review-only",
+            "statusCheckRollup" => [
+              %{"name" => "symphony/autonomous-review", "status" => "COMPLETED", "conclusion" => "SUCCESS"}
+            ]
+          }),
+          0
+        }
+
+      ["pr", "view", "32", "--repo", "devp1/Beacon", "--json", "url,number,state,headRefOid,statusCheckRollup,reviewDecision"] ->
+        {
+          Jason.encode!(%{
+            "url" => "https://github.com/devp1/Beacon/pull/32",
+            "number" => 32,
+            "state" => "OPEN",
+            "headRefOid" => "ci-pass",
+            "statusCheckRollup" => [
+              %{"name" => "symphony/autonomous-review", "status" => "COMPLETED", "conclusion" => "SUCCESS"},
+              %{"name" => "ci", "status" => "COMPLETED", "conclusion" => "SUCCESS"}
+            ]
+          }),
+          0
+        }
+    end)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
+
+    review_only =
+      GitHubClient.normalize_issue_for_test(%{
+        "number" => 21,
+        "title" => "Review only",
+        "state" => "open",
+        "labels" => [%{"name" => "symphony"}, %{"name" => "human-review"}]
+      })
+
+    ci_pass =
+      GitHubClient.normalize_issue_for_test(%{
+        "number" => 22,
+        "title" => "CI pass",
+        "state" => "open",
+        "labels" => [%{"name" => "symphony"}, %{"name" => "human-review"}]
+      })
+
+    assert review_only.check_state == "none"
+    assert ci_pass.check_state == "passing"
+  end
+
   test "closed GitHub issues normalize as Done" do
     issue = %{
       "number" => 13,

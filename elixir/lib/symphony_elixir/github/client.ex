@@ -513,7 +513,7 @@ defmodule SymphonyElixir.GitHub.Client do
            pr_number: Map.get(pr, "number"),
            pr_state: Map.get(pr, "state"),
            head_sha: Map.get(pr, "headRefOid"),
-           check_state: status_check_state(Map.get(pr, "statusCheckRollup")),
+           check_state: status_check_state(Map.get(pr, "statusCheckRollup"), repo_config),
            review_state: Map.get(pr, "reviewDecision")
          }}
 
@@ -525,18 +525,55 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp status_check_state(nil), do: nil
-  defp status_check_state([]), do: "none"
+  defp status_check_state(nil, _repo_config), do: nil
 
-  defp status_check_state(checks) when is_list(checks) do
+  defp status_check_state(checks, repo_config) when is_list(checks) do
+    checks = required_status_checks(checks, repo_config)
+
     cond do
+      checks == [] -> "none"
       Enum.any?(checks, &failing_check?/1) -> "failing"
       Enum.any?(checks, &pending_check?/1) -> "pending"
       true -> "passing"
     end
   end
 
-  defp status_check_state(_checks), do: nil
+  defp status_check_state(_checks, _repo_config), do: nil
+
+  defp required_status_checks(checks, _repo_config) do
+    required_names = Config.settings!().github.required_check_names
+
+    case required_names do
+      [] -> checks
+      [_ | _] -> Enum.filter(checks, &status_check_required?(&1, required_names))
+    end
+  end
+
+  defp status_check_required?(check, required_names) when is_map(check) do
+    check
+    |> status_check_candidate_names()
+    |> Enum.any?(&(&1 in required_names))
+  end
+
+  defp status_check_required?(_check, _required_names), do: false
+
+  defp status_check_candidate_names(check) do
+    [Map.get(check, "name"), Map.get(check, "workflowName")]
+    |> Enum.concat(workflow_qualified_status_check_names(check))
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp workflow_qualified_status_check_names(check) do
+    case {Map.get(check, "workflowName"), Map.get(check, "name")} do
+      {workflow_name, name} when is_binary(workflow_name) and is_binary(name) ->
+        ["#{workflow_name} / #{name}"]
+
+      _ ->
+        []
+    end
+  end
 
   defp failing_check?(check) when is_map(check) do
     conclusion = check |> Map.get("conclusion") |> normalize_github_state()

@@ -24,7 +24,8 @@ github:
   #   installation_id: $SYMPHONY_GITHUB_REVIEWER_INSTALLATION_ID
   #   private_key_path: $SYMPHONY_GITHUB_REVIEWER_PRIVATE_KEY_PATH
   review_check_name: symphony/autonomous-review
-  required_check_names: []
+  required_check_names:
+    - ci
 repos:
   - id: beacon
     owner: devp1

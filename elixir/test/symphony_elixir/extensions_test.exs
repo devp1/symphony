@@ -616,11 +616,56 @@ defmodule SymphonyElixir.ExtensionsTest do
            } = json_response(post(build_conn(), "/api/v1/issues/beacon/11/merge", %{}), 409)
   end
 
+  test "phoenix readiness api reports operator-critical infrastructure checks" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_builder_token: "builder-token",
+      github_reviewer_token: "reviewer-token",
+      repos: [
+        %{
+          id: "beacon",
+          owner: "devp1",
+          name: "Beacon",
+          clone_url: "https://github.com/devp1/Beacon.git"
+        }
+      ]
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :ReadinessOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot()
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    assert %{
+             "ready" => true,
+             "checks" => %{
+               "workflow_loaded" => true,
+               "sqlite_reachable" => true,
+               "repos_configured" => true,
+               "builder_auth_present" => true,
+               "reviewer_auth_independent" => true,
+               "orchestrator_available" => true,
+               "server_active" => true
+             },
+             "repos" => ["beacon"]
+           } = json_response(get(build_conn(), "/api/v1/readiness"), 200)
+  end
+
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
     unavailable_orchestrator = Module.concat(__MODULE__, :UnavailableOrchestrator)
     start_test_endpoint(orchestrator: unavailable_orchestrator, snapshot_timeout_ms: 5)
 
     assert json_response(post(build_conn(), "/api/v1/state", %{}), 405) ==
+             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+
+    assert json_response(post(build_conn(), "/api/v1/readiness", %{}), 405) ==
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(get(build_conn(), "/api/v1/refresh"), 405) ==

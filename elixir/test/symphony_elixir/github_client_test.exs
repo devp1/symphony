@@ -308,6 +308,124 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert ci_pass.check_state == "passing"
   end
 
+  test "linked pull request metadata falls back to CLI checks when GraphQL rollup is inaccessible" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_required_check_names: ["ci"]
+    )
+
+    Application.put_env(:symphony_elixir, :github_command_fun, fn
+      [
+        "issue",
+        "view",
+        "31",
+        "--repo",
+        "devp1/Beacon",
+        "--json",
+        "closedByPullRequestsReferences"
+      ] ->
+        {Jason.encode!(%{"closedByPullRequestsReferences" => [%{"number" => 41}]}), 0}
+
+      ["pr", "view", "41", "--repo", "devp1/Beacon", "--json", "url,number,state,headRefOid,statusCheckRollup,reviewDecision"] ->
+        {"GraphQL: Resource not accessible by integration", 1}
+
+      ["pr", "view", "41", "--repo", "devp1/Beacon", "--json", "url,number,state,headRefOid,reviewDecision"] ->
+        {
+          Jason.encode!(%{
+            "url" => "https://github.com/devp1/Beacon/pull/41",
+            "number" => 41,
+            "state" => "OPEN",
+            "headRefOid" => "cli-sha",
+            "reviewDecision" => "APPROVED"
+          }),
+          0
+        }
+
+      ["pr", "checks", "41", "--repo", "devp1/Beacon", "--json", "name,state,bucket,workflow"] ->
+        {
+          Jason.encode!([
+            %{"name" => "ci", "state" => "SUCCESS", "bucket" => "pass", "workflow" => "Beacon CI"}
+          ]),
+          0
+        }
+    end)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
+
+    issue =
+      GitHubClient.normalize_issue_for_test(%{
+        "number" => 31,
+        "title" => "CLI checks fallback",
+        "state" => "open",
+        "labels" => [%{"name" => "symphony"}, %{"name" => "human-review"}]
+      })
+
+    assert issue.pr_url == "https://github.com/devp1/Beacon/pull/41"
+    assert issue.head_sha == "cli-sha"
+    assert issue.pr_state == "OPEN"
+    assert issue.check_state == "passing"
+    assert issue.review_state == "APPROVED"
+  end
+
+  test "linked pull request metadata can use operator gh auth for read-only check rollup fallback" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_builder_token: "builder-token",
+      github_required_check_names: ["ci"]
+    )
+
+    builder_env = [{"GH_TOKEN", "builder-token"}, {"GITHUB_TOKEN", "builder-token"}]
+
+    Application.put_env(:symphony_elixir, :github_command_fun, fn
+      [
+        "issue",
+        "view",
+        "32",
+        "--repo",
+        "devp1/Beacon",
+        "--json",
+        "closedByPullRequestsReferences"
+      ],
+      ^builder_env ->
+        {Jason.encode!(%{"closedByPullRequestsReferences" => [%{"number" => 42}]}), 0}
+
+      ["pr", "view", "42", "--repo", "devp1/Beacon", "--json", "url,number,state,headRefOid,statusCheckRollup,reviewDecision"], ^builder_env ->
+        {"GraphQL: Resource not accessible by integration", 1}
+
+      ["pr", "view", "42", "--repo", "devp1/Beacon", "--json", "url,number,state,headRefOid,statusCheckRollup,reviewDecision"], [] ->
+        {
+          Jason.encode!(%{
+            "url" => "https://github.com/devp1/Beacon/pull/42",
+            "number" => 42,
+            "state" => "OPEN",
+            "headRefOid" => "operator-sha",
+            "statusCheckRollup" => [
+              %{"name" => "ci", "status" => "COMPLETED", "conclusion" => "SUCCESS", "workflowName" => "Beacon CI"}
+            ]
+          }),
+          0
+        }
+    end)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
+
+    issue =
+      GitHubClient.normalize_issue_for_test(%{
+        "number" => 32,
+        "title" => "Operator metadata fallback",
+        "state" => "open",
+        "labels" => [%{"name" => "symphony"}, %{"name" => "human-review"}]
+      })
+
+    assert issue.pr_url == "https://github.com/devp1/Beacon/pull/42"
+    assert issue.head_sha == "operator-sha"
+    assert issue.check_state == "passing"
+  end
+
   test "closed GitHub issues normalize as Done" do
     issue = %{
       "number" => 13,

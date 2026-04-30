@@ -296,7 +296,7 @@ codex:
   workspace and attempts Codex `thread/resume`; if that fails, Symphony records a warning and starts
   a fresh persisted thread.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/repos`, `/api/v1/issues`, `/api/v1/runs/:id`,
+  `/`, `/api/v1/state`, `/api/v1/readiness`, `/api/v1/repos`, `/api/v1/issues`, `/api/v1/runs/:id`,
   `/api/v1/runs/:run_id/cancel`, `/api/v1/issues/:repo_id/:number/rerun`,
   `/api/v1/issues/:repo_id/:number/merge`, `/api/v1/issues/:repo_id/:number/stop-session`,
   `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.

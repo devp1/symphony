@@ -1688,9 +1688,17 @@ Minimum endpoints:
 - `GET /api/v1/repos`
   - Returns configured repository metadata used by the cockpit.
 
+- `GET /api/v1/readiness`
+  - Returns a small operator readiness report for the local cockpit runtime, including workflow,
+    SQLite, repo config, builder/reviewer auth, orchestrator availability, and server activity.
+
 - `GET /api/v1/issues`
   - Returns the persisted issue snapshot list, including GitHub label state and any reconciled
     PR metadata such as PR URL, head SHA, check state, and review state.
+  - PR/check reconciliation reads through the configured GitHub App first. If that installation
+    cannot read GitHub's check rollup, local trusted Symphony may fall back to the operator's
+    authenticated `gh` CLI for read-only PR/check metadata; merge/review writes still use the
+    Builder/Reviewer identities.
 
 - `GET /api/v1/runs/:run_id`
   - Returns persisted run details, including issue session identity, Codex thread/session telemetry,

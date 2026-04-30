@@ -3175,8 +3175,10 @@ defmodule SymphonyElixir.Orchestrator do
   defp merge_issue_pr_now(repo_id, number) do
     with {:ok, number} <- issue_number(number),
          {:ok, issue_snapshot} <- stored_issue_snapshot(repo_id, number),
-         issue = AutonomousReview.issue_from_snapshot(issue_snapshot),
          latest_review = latest_autonomous_review_for_issue(repo_id, number),
+         snapshot_issue = AutonomousReview.issue_from_snapshot(issue_snapshot),
+         {:ok, issue} <- GitHub.Client.refresh_issue_for_merge(snapshot_issue, latest_review),
+         :ok <- Storage.record_issue_snapshot(issue_snapshot_attrs(issue)),
          gate = AutonomousReview.merge_gate(issue, latest_review),
          :ok <- ensure_merge_gate_ready(gate),
          {:ok, merge_response} <- GitHub.Client.merge_pull_request(issue) do

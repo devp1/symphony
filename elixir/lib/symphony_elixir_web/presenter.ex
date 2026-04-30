@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{AutonomousReview, Config, Orchestrator, StatusDashboard, Storage}
+  alias SymphonyElixir.{AutonomousReview, Config, Orchestrator, StatusDashboard, Storage, Workflow}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -73,6 +73,30 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
+  @spec readiness_payload(GenServer.name(), timeout()) :: {200 | 503, map()}
+  def readiness_payload(orchestrator, snapshot_timeout_ms) do
+    checks = %{
+      workflow_loaded: workflow_loaded?(),
+      sqlite_reachable: sqlite_reachable?(),
+      repos_configured: Config.repos() != [],
+      builder_auth_present: not is_nil(Config.github_auth(:builder)),
+      reviewer_auth_independent: Config.independent_github_reviewer?(),
+      orchestrator_available: orchestrator_available?(orchestrator, snapshot_timeout_ms),
+      server_active: true
+    }
+
+    ready = checks |> Map.values() |> Enum.all?(&(&1 == true))
+    status = if ready, do: 200, else: 503
+
+    {status,
+     %{
+       ready: ready,
+       generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+       checks: checks,
+       repos: Enum.map(Config.repos(), & &1.id)
+     }}
+  end
+
   @spec repos_payload() :: [map()]
   def repos_payload do
     Config.repos()
@@ -135,6 +159,30 @@ defmodule SymphonyElixirWeb.Presenter do
       last_error: retry && retry.error,
       tracked: %{}
     }
+  end
+
+  defp workflow_loaded? do
+    match?({:ok, %{config: config}} when is_map(config), Workflow.current())
+  rescue
+    _error -> false
+  catch
+    _kind, _reason -> false
+  end
+
+  defp sqlite_reachable? do
+    _ = Storage.list_issues()
+    true
+  rescue
+    _error -> false
+  catch
+    _kind, _reason -> false
+  end
+
+  defp orchestrator_available?(orchestrator, snapshot_timeout_ms) do
+    case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
+      %{} -> true
+      _ -> false
+    end
   end
 
   defp issue_id_from_entries(running, retry),

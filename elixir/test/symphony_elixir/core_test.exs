@@ -2019,7 +2019,9 @@ defmodule SymphonyElixir.CoreTest do
       tracker_owner: "devp1",
       tracker_repo: "Beacon",
       github_builder_token: "builder-token",
-      github_reviewer_token: "reviewer-token"
+      github_reviewer_token: "reviewer-token",
+      github_required_check_names: ["ci"],
+      repos: [beacon_repo_config()]
     )
 
     :ok =
@@ -2055,9 +2057,22 @@ defmodule SymphonyElixir.CoreTest do
 
     parent = self()
 
-    Application.put_env(:symphony_elixir, :github_command_fun, fn args, _env ->
-      send(parent, {:unexpected_gh_merge, args})
-      {Jason.encode!(%{"merged" => true}), 0}
+    Application.put_env(:symphony_elixir, :github_command_fun, fn
+      ["api", "repos/devp1/Beacon/issues/31"], _env ->
+        {Jason.encode!(github_issue_payload(31, "Blocked merge")), 0}
+
+      ["issue", "view", "31", "--repo", "devp1/Beacon", "--json", "closedByPullRequestsReferences"], _env ->
+        {Jason.encode!(%{"closedByPullRequestsReferences" => []}), 0}
+
+      ["api", "repos/devp1/Beacon/issues/31/timeline", "-H", "Accept: application/vnd.github+json", "-F", "per_page=100"], _env ->
+        {Jason.encode!([]), 0}
+
+      ["pr", "view", "31", "--repo", "devp1/Beacon", "--json", "url,number,state,headRefOid,statusCheckRollup,reviewDecision"], _env ->
+        {Jason.encode!(github_pr_payload(31, "abc123", [%{"name" => "symphony/autonomous-review", "status" => "COMPLETED", "conclusion" => "SUCCESS"}])), 0}
+
+      args, _env ->
+        send(parent, {:unexpected_gh_merge, args})
+        {Jason.encode!(%{"merged" => true}), 0}
     end)
 
     on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
@@ -2069,17 +2084,18 @@ defmodule SymphonyElixir.CoreTest do
     assert {:reply, {:error, {:merge_gate_blocked, reasons}}, ^state} =
              Orchestrator.handle_call({:merge_issue_pr, "beacon", 31}, self(), state)
 
-    assert "ci-not-green" in reasons
+    assert "ci-not-reported" in reasons
     refute_receive {:unexpected_gh_merge, _args}
   end
 
-  test "merge_issue_pr merges ready PRs through the builder GitHub identity" do
+  test "merge_issue_pr refreshes stale snapshots from review PR hints and merges through the builder GitHub identity" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",
       tracker_owner: "devp1",
       tracker_repo: "Beacon",
       github_builder_token: "builder-token",
-      github_reviewer_token: "reviewer-token"
+      github_reviewer_token: "reviewer-token",
+      repos: [beacon_repo_config()]
     )
 
     :ok =
@@ -2089,12 +2105,7 @@ defmodule SymphonyElixir.CoreTest do
         identifier: "GH-32",
         title: "Ready merge",
         state: "Human Review",
-        labels: ["symphony", "human-review"],
-        pr_url: "https://github.com/devp1/Beacon/pull/32",
-        head_sha: "def456",
-        pr_state: "OPEN",
-        check_state: "passing",
-        review_state: "APPROVED"
+        labels: ["symphony", "human-review"]
       })
 
     assert {:ok, _review_id} =
@@ -2140,9 +2151,26 @@ defmodule SymphonyElixir.CoreTest do
 
     parent = self()
 
-    Application.put_env(:symphony_elixir, :github_command_fun, fn args, env ->
-      send(parent, {:gh_merge_args, args, env})
-      {Jason.encode!(%{"merged" => true}), 0}
+    Application.put_env(:symphony_elixir, :github_command_fun, fn
+      ["api", "repos/devp1/Beacon/issues/32"], _env ->
+        {Jason.encode!(github_issue_payload(32, "Ready merge")), 0}
+
+      ["issue", "view", "32", "--repo", "devp1/Beacon", "--json", "closedByPullRequestsReferences"], _env ->
+        {Jason.encode!(%{"closedByPullRequestsReferences" => []}), 0}
+
+      ["api", "repos/devp1/Beacon/issues/32/timeline", "-H", "Accept: application/vnd.github+json", "-F", "per_page=100"], _env ->
+        {Jason.encode!([]), 0}
+
+      ["pr", "view", "32", "--repo", "devp1/Beacon", "--json", "url,number,state,headRefOid,statusCheckRollup,reviewDecision"], _env ->
+        {Jason.encode!(github_pr_payload(32, "def456", [%{"name" => "ci", "status" => "COMPLETED", "conclusion" => "SUCCESS"}])), 0}
+
+      ["api", "repos/devp1/Beacon/pulls/32/merge" | _] = args, env ->
+        send(parent, {:gh_merge_args, args, env})
+        {Jason.encode!(%{"merged" => true}), 0}
+
+      ["api", "repos/devp1/Beacon/issues/32", "-X", "PATCH", "-f", "state=closed"] = args, env ->
+        send(parent, {:gh_merge_args, args, env})
+        {Jason.encode!(%{"state" => "closed"}), 0}
     end)
 
     on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
@@ -2216,12 +2244,116 @@ defmodule SymphonyElixir.CoreTest do
            } = Enum.find(SymphonyElixir.Storage.list_issues(), &(&1["identifier"] == "GH-32"))
   end
 
+  test "merge_issue_pr blocks stale autonomous reviews after refreshing the PR head" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_owner: "devp1",
+      tracker_repo: "Beacon",
+      github_builder_token: "builder-token",
+      github_reviewer_token: "reviewer-token",
+      github_required_check_names: ["ci"],
+      repos: [beacon_repo_config()]
+    )
+
+    :ok =
+      SymphonyElixir.Storage.record_issue_snapshot(%{
+        repo_id: "beacon",
+        number: 33,
+        identifier: "GH-33",
+        title: "Stale review",
+        state: "Human Review",
+        labels: ["symphony", "human-review"]
+      })
+
+    assert {:ok, _review_id} =
+             SymphonyElixir.Storage.record_autonomous_review(%{
+               id: "stale-review",
+               repo_id: "beacon",
+               issue_number: 33,
+               issue_identifier: "GH-33",
+               pr_url: "https://github.com/devp1/Beacon/pull/33",
+               head_sha: "old-sha",
+               reviewer_kind: "review-agent",
+               verdict: "pass",
+               summary: "clean before new commits",
+               check_name: "symphony/autonomous-review",
+               check_conclusion: "success",
+               stale: false
+             })
+
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :github_command_fun, fn
+      ["api", "repos/devp1/Beacon/issues/33"], _env ->
+        {Jason.encode!(github_issue_payload(33, "Stale review")), 0}
+
+      ["issue", "view", "33", "--repo", "devp1/Beacon", "--json", "closedByPullRequestsReferences"], _env ->
+        {Jason.encode!(%{"closedByPullRequestsReferences" => []}), 0}
+
+      ["api", "repos/devp1/Beacon/issues/33/timeline", "-H", "Accept: application/vnd.github+json", "-F", "per_page=100"], _env ->
+        {Jason.encode!([]), 0}
+
+      ["pr", "view", "33", "--repo", "devp1/Beacon", "--json", "url,number,state,headRefOid,statusCheckRollup,reviewDecision"], _env ->
+        {Jason.encode!(github_pr_payload(33, "new-sha", [%{"name" => "ci", "status" => "COMPLETED", "conclusion" => "SUCCESS"}])), 0}
+
+      args, _env ->
+        send(parent, {:unexpected_gh_merge, args})
+        {Jason.encode!(%{"merged" => true}), 0}
+    end)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
+
+    state = %Orchestrator.State{
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:reply, {:error, {:merge_gate_blocked, reasons}}, ^state} =
+             Orchestrator.handle_call({:merge_issue_pr, "beacon", 33}, self(), state)
+
+    assert "autonomous-review-stale" in reasons
+    refute_receive {:unexpected_gh_merge, _args}
+
+    assert %{"head_sha" => "new-sha", "check_state" => "passing"} =
+             Enum.find(SymphonyElixir.Storage.list_issues(), &(&1["identifier"] == "GH-33"))
+  end
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
     scheduling_tolerance_ms = 500
 
     assert remaining_ms >= min_remaining_ms - scheduling_tolerance_ms
     assert remaining_ms <= max_remaining_ms
+  end
+
+  defp github_issue_payload(number, title) do
+    %{
+      "number" => number,
+      "title" => title,
+      "state" => "open",
+      "body" => "Issue #{number}",
+      "html_url" => "https://github.com/devp1/Beacon/issues/#{number}",
+      "labels" => [%{"name" => "symphony"}, %{"name" => "human-review"}]
+    }
+  end
+
+  defp beacon_repo_config do
+    %{
+      id: "beacon",
+      owner: "devp1",
+      name: "Beacon",
+      clone_url: "https://github.com/devp1/Beacon.git"
+    }
+  end
+
+  defp github_pr_payload(number, head_sha, checks) do
+    %{
+      "url" => "https://github.com/devp1/Beacon/pull/#{number}",
+      "number" => number,
+      "state" => "OPEN",
+      "headRefOid" => head_sha,
+      "statusCheckRollup" => checks,
+      "reviewDecision" => "APPROVED"
+    }
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)

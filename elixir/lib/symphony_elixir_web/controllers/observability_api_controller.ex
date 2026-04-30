@@ -24,6 +24,15 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     json(conn, %{issues: Presenter.issues_payload()})
   end
 
+  @spec readiness(Conn.t(), map()) :: Conn.t()
+  def readiness(conn, _params) do
+    {status, payload} = Presenter.readiness_payload(orchestrator(), snapshot_timeout_ms())
+
+    conn
+    |> put_status(status)
+    |> json(payload)
+  end
+
   @spec run(Conn.t(), map()) :: Conn.t()
   def run(conn, %{"run_id" => run_id}) do
     case Presenter.run_payload(run_id) do

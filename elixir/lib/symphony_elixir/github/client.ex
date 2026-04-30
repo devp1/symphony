@@ -211,6 +211,13 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  @spec refresh_issue_for_merge(Issue.t(), map() | nil) :: {:ok, Issue.t()} | {:error, term()}
+  def refresh_issue_for_merge(%Issue{} = issue, latest_review \\ nil) do
+    with {:ok, live_issue} <- fetch_issue(issue_id_for_refresh(issue)) do
+      hydrate_issue_pr_metadata(live_issue, latest_review)
+    end
+  end
+
   @doc false
   @spec command_env_for_test(github_role()) :: [{String.t(), String.t()}]
   def command_env_for_test(role) do
@@ -531,10 +538,196 @@ defmodule SymphonyElixir.GitHub.Client do
       {:ok, _other} ->
         {:error, :github_unexpected_pr}
 
-      {:error, reason} ->
-        {:error, reason}
+      {:error, _reason} ->
+        fetch_pr_metadata_via_operator_rollup(repo_config, pr_number)
     end
   end
+
+  defp fetch_pr_metadata_via_operator_rollup(repo_config, pr_number) when is_integer(pr_number) do
+    case gh_json(
+           repo_config,
+           [
+             "pr",
+             "view",
+             Integer.to_string(pr_number),
+             "--repo",
+             "#{repo_config.owner}/#{repo_config.name}",
+             "--json",
+             "url,number,state,headRefOid,statusCheckRollup,reviewDecision"
+           ],
+           :operator
+         ) do
+      {:ok, pr} when is_map(pr) ->
+        {:ok,
+         %{
+           pr_url: Map.get(pr, "url"),
+           pr_number: Map.get(pr, "number"),
+           pr_state: Map.get(pr, "state"),
+           head_sha: Map.get(pr, "headRefOid"),
+           check_state: status_check_state(Map.get(pr, "statusCheckRollup"), repo_config),
+           review_state: Map.get(pr, "reviewDecision")
+         }}
+
+      {:ok, _other} ->
+        {:error, :github_unexpected_pr}
+
+      {:error, _reason} ->
+        fetch_pr_metadata_via_cli_checks(repo_config, pr_number)
+    end
+  end
+
+  defp fetch_pr_metadata_via_cli_checks(repo_config, pr_number) when is_integer(pr_number) do
+    case fetch_pr_identity_metadata(repo_config, pr_number) do
+      {:ok, pr} when is_map(pr) ->
+        case fetch_pr_checks(repo_config, pr_number) do
+          {:ok, checks} ->
+            {:ok,
+             %{
+               pr_url: Map.get(pr, "url"),
+               pr_number: Map.get(pr, "number"),
+               pr_state: Map.get(pr, "state"),
+               head_sha: Map.get(pr, "headRefOid"),
+               check_state: status_check_state(checks, repo_config),
+               review_state: Map.get(pr, "reviewDecision")
+             }}
+
+          {:error, reason} ->
+            {:error, {:github_pr_checks_failed, "#{repo_config.owner}/#{repo_config.name}", pr_number, reason}}
+        end
+
+      {:ok, _other} ->
+        {:error, :github_unexpected_pr}
+
+      {:error, _reason} ->
+        fetch_pr_metadata_via_rest(repo_config, pr_number)
+    end
+  end
+
+  defp fetch_pr_identity_metadata(repo_config, pr_number) do
+    gh_json(repo_config, [
+      "pr",
+      "view",
+      Integer.to_string(pr_number),
+      "--repo",
+      "#{repo_config.owner}/#{repo_config.name}",
+      "--json",
+      "url,number,state,headRefOid,reviewDecision"
+    ])
+  end
+
+  defp fetch_pr_checks(repo_config, pr_number) do
+    case gh_json(repo_config, [
+           "pr",
+           "checks",
+           Integer.to_string(pr_number),
+           "--repo",
+           "#{repo_config.owner}/#{repo_config.name}",
+           "--json",
+           "name,state,bucket,workflow"
+         ]) do
+      {:ok, checks} when is_list(checks) -> {:ok, checks}
+      {:ok, _other} -> {:error, :github_unexpected_pr_checks}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp fetch_pr_metadata_via_rest(repo_config, pr_number) when is_integer(pr_number) do
+    with {:ok, pr} when is_map(pr) <-
+           gh_api(repo_config, [
+             "repos/#{repo_config.owner}/#{repo_config.name}/pulls/#{pr_number}",
+             "-H",
+             "Accept: application/vnd.github+json"
+           ]),
+         head_sha when is_binary(head_sha) and head_sha != "" <- get_in(pr, ["head", "sha"]),
+         {:ok, checks} <- fetch_commit_checks(repo_config, head_sha) do
+      {:ok,
+       %{
+         pr_url: Map.get(pr, "html_url"),
+         pr_number: Map.get(pr, "number"),
+         pr_state: Map.get(pr, "state") |> normalize_pr_state(),
+         head_sha: head_sha,
+         check_state: status_check_state(checks, repo_config),
+         review_state: nil
+       }}
+    else
+      {:ok, _other} -> {:error, :github_unexpected_pr}
+      nil -> {:error, :missing_pr_head_sha}
+      "" -> {:error, :missing_pr_head_sha}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp fetch_commit_checks(repo_config, head_sha) do
+    case gh_api(repo_config, [
+           "repos/#{repo_config.owner}/#{repo_config.name}/commits/#{head_sha}/check-runs",
+           "-H",
+           "Accept: application/vnd.github+json",
+           "-F",
+           "per_page=100"
+         ]) do
+      {:ok, %{"check_runs" => checks}} when is_list(checks) -> {:ok, checks}
+      {:ok, _other} -> {:error, :github_unexpected_check_runs}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp normalize_pr_state(state) when is_binary(state), do: state |> String.trim() |> String.upcase()
+  defp normalize_pr_state(state), do: state
+
+  defp hydrate_issue_pr_metadata(%Issue{} = issue, latest_review) do
+    repo_config = repo_config_for_issue(issue)
+
+    case merge_pr_number(issue, latest_review) do
+      {:ok, pr_number} ->
+        case fetch_pr_metadata(repo_config, pr_number) do
+          {:ok, metadata} -> {:ok, struct(issue, metadata)}
+          {:error, reason} -> {:error, reason}
+        end
+
+      :missing ->
+        {:ok, issue}
+    end
+  end
+
+  defp merge_pr_number(%Issue{pr_number: number}, _latest_review) when is_integer(number), do: {:ok, number}
+
+  defp merge_pr_number(%Issue{} = issue, latest_review) do
+    case pull_request_number(issue) do
+      {:ok, number} when is_integer(number) ->
+        {:ok, number}
+
+      {:ok, number} when is_binary(number) ->
+        parse_integer(number)
+
+      _ ->
+        latest_review
+        |> review_pr_url()
+        |> pr_number_from_url()
+    end
+  end
+
+  defp review_pr_url(%{} = review), do: Map.get(review, "pr_url") || Map.get(review, :pr_url)
+  defp review_pr_url(_review), do: nil
+
+  defp pr_number_from_url(pr_url) when is_binary(pr_url) do
+    case Regex.run(~r{/pull/(\d+)(?:\z|[/?#])}, pr_url) do
+      [_match, number] -> parse_integer(number)
+      _ -> :missing
+    end
+  end
+
+  defp pr_number_from_url(_pr_url), do: :missing
+
+  defp parse_integer(number) when is_binary(number) do
+    case Integer.parse(number) do
+      {parsed, ""} -> {:ok, parsed}
+      _ -> :missing
+    end
+  end
+
+  defp issue_id_for_refresh(%Issue{id: id}) when is_binary(id) and id != "", do: id
+  defp issue_id_for_refresh(%Issue{repo_id: repo_id, number: number}) when is_binary(repo_id) and is_integer(number), do: issue_id(repo_id, number)
+  defp issue_id_for_refresh(%Issue{number: number}) when is_integer(number), do: to_string(number)
 
   defp status_check_state(nil, _repo_config), do: nil
 
@@ -569,7 +762,7 @@ defmodule SymphonyElixir.GitHub.Client do
   defp status_check_required?(_check, _required_names), do: false
 
   defp status_check_candidate_names(check) do
-    [Map.get(check, "name"), Map.get(check, "workflowName")]
+    [Map.get(check, "name"), Map.get(check, "workflowName"), Map.get(check, "workflow")]
     |> Enum.concat(workflow_qualified_status_check_names(check))
     |> Enum.filter(&is_binary/1)
     |> Enum.map(&String.trim/1)
@@ -577,7 +770,7 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp workflow_qualified_status_check_names(check) do
-    case {Map.get(check, "workflowName"), Map.get(check, "name")} do
+    case {Map.get(check, "workflowName") || Map.get(check, "workflow"), Map.get(check, "name")} do
       {workflow_name, name} when is_binary(workflow_name) and is_binary(name) ->
         ["#{workflow_name} / #{name}"]
 
@@ -589,9 +782,13 @@ defmodule SymphonyElixir.GitHub.Client do
   defp failing_check?(check) when is_map(check) do
     conclusion = check |> Map.get("conclusion") |> normalize_github_state()
     status = check |> Map.get("status") |> normalize_github_state()
+    state = check |> Map.get("state") |> normalize_github_state()
+    bucket = check |> Map.get("bucket") |> normalize_github_state()
 
     conclusion in ["failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"] or
-      status in ["failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"]
+      status in ["failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"] or
+      state in ["failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"] or
+      bucket in ["fail", "failing", "cancelled"]
   end
 
   defp failing_check?(_check), do: false
@@ -599,8 +796,15 @@ defmodule SymphonyElixir.GitHub.Client do
   defp pending_check?(check) when is_map(check) do
     conclusion = check |> Map.get("conclusion") |> normalize_github_state()
     status = check |> Map.get("status") |> normalize_github_state()
+    state = check |> Map.get("state") |> normalize_github_state()
+    bucket = check |> Map.get("bucket") |> normalize_github_state()
 
-    is_nil(conclusion) and status not in ["completed", "success", "neutral", "skipped"]
+    cond do
+      bucket == "pending" -> true
+      bucket in ["pass", "skip"] -> false
+      not is_nil(state) -> state not in ["completed", "success", "neutral", "skipped"]
+      true -> is_nil(conclusion) and status not in ["completed", "success", "neutral", "skipped"]
+    end
   end
 
   defp pending_check?(_check), do: false
@@ -721,6 +925,8 @@ defmodule SymphonyElixir.GitHub.Client do
         {:ok, []}
     end
   end
+
+  defp command_env(:operator), do: {:ok, []}
 
   defp primary_repo! do
     Config.primary_repo() || %{id: "github", owner: Config.settings!().tracker.owner, name: Config.settings!().tracker.repo, labels: %{}}

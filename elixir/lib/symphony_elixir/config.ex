@@ -26,7 +26,7 @@ defmodule SymphonyElixir.Config do
           turn_sandbox_policy: map()
         }
 
-  @type github_role :: :builder | :reviewer
+  @type github_role :: :builder | :reviewer | :operator
   @type github_auth :: {:app, map()} | {:token, String.t()} | nil
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}

@@ -2182,7 +2182,20 @@ defmodule SymphonyElixir.CoreTest do
              "pr_state" => "MERGED",
              "check_state" => "passing",
              "review_state" => "APPROVED",
-             "events" => [%{"message" => "cockpit merge requested"}]
+             "events" => [
+               %{
+                 "message" => "cockpit merge requested",
+                 "data" => %{
+                   "merge_response" => %{"merged" => true},
+                   "post_merge_update" => %{
+                     "tracker" => ":ok",
+                     "issue_snapshot" => ":ok",
+                     "run" => ":ok",
+                     "issue_session" => ":ok"
+                   }
+                 }
+               }
+             ]
            } = SymphonyElixir.Storage.get_run(run_id)
 
     assert %{"state" => "stopped", "health" => ["merged"], "stop_reason" => "merged"} =

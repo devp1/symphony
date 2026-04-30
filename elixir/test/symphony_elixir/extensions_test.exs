@@ -87,7 +87,26 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
 
     def handle_call({:merge_issue_pr, repo_id, number}, _from, state) do
-      response = Keyword.get(state, :merge_response, {:ok, %{repo_id: repo_id, number: to_string(number), merged: true}})
+      response =
+        Keyword.get(state, :merge_response, {
+          :ok,
+          %{
+            repo_id: repo_id,
+            number: to_string(number),
+            issue_identifier: "#{repo_id}-#{number}",
+            pr_url: "https://github.com/devp1/Beacon/pull/#{number}",
+            merge_response: %{"merged" => true},
+            post_merge_update: %{
+              tracker: ":ok",
+              issue_snapshot: ":ok",
+              run: ":ok",
+              issue_session: ":ok",
+              run_id: "run-#{repo_id}-#{number}",
+              issue_session_id: "issue-session-#{repo_id}-#{number}"
+            }
+          }
+        })
+
       {:reply, response, state}
     end
 
@@ -503,8 +522,17 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert %{"ok" => true, "action" => "rerun_requested"} =
              json_response(post(build_conn(), "/api/v1/issues/beacon/10/rerun", %{}), 202)
 
-    assert %{"ok" => true, "action" => "merge_requested"} =
-             json_response(post(build_conn(), "/api/v1/issues/beacon/11/merge", %{}), 202)
+    assert %{
+             "ok" => true,
+             "action" => "merge_requested",
+             "merge_response" => %{"merged" => true},
+             "post_merge_update" => %{
+               "tracker" => ":ok",
+               "issue_snapshot" => ":ok",
+               "run" => ":ok",
+               "issue_session" => ":ok"
+             }
+           } = json_response(post(build_conn(), "/api/v1/issues/beacon/11/merge", %{}), 202)
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
     issue_payload = json_response(conn, 200)
@@ -714,6 +742,48 @@ defmodule SymphonyElixir.ExtensionsTest do
         review_state: "APPROVED"
       })
 
+    :ok =
+      SymphonyElixir.Storage.record_issue_snapshot(%{
+        repo_id: "beacon",
+        number: 21,
+        identifier: "beacon-21",
+        title: "Merged proof",
+        state: "Done",
+        labels: ["symphony", "done"],
+        pr_url: "https://github.com/devp1/Beacon/pull/21",
+        head_sha: "merged-sha",
+        pr_state: "MERGED",
+        check_state: "passing",
+        review_state: "APPROVED"
+      })
+
+    assert {:ok, merged_run_id} =
+             SymphonyElixir.Storage.start_run(%{
+               id: "run-live-merged",
+               repo_id: "beacon",
+               issue_number: 21,
+               issue_identifier: "beacon-21",
+               issue_session_id: "issue-session-live-merged",
+               state: "completed",
+               session_state: "stopped",
+               health: ["merged"],
+               pr_url: "https://github.com/devp1/Beacon/pull/21",
+               pr_state: "MERGED",
+               check_state: "passing",
+               review_state: "APPROVED"
+             })
+
+    :ok =
+      SymphonyElixir.Storage.append_event(merged_run_id, "info", "cockpit merge requested", %{
+        merge_response: %{"merged" => true},
+        post_merge_update: %{
+          tracker: ":ok",
+          issue_snapshot: ":ok",
+          run: ":ok",
+          issue_session: ":ok"
+        }
+      })
+
     assert {:ok, _review_id} =
              SymphonyElixir.Storage.record_autonomous_review(%{
                id: "live-review-ready",
@@ -749,6 +819,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "PR handoff"
     assert html =~ "merge-ready"
     assert html =~ "Merge"
+    assert html =~ "Merge audit"
+    assert html =~ "tracker"
+    assert html =~ "run detail"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     assert html =~ "Refresh now"

@@ -302,9 +302,11 @@ Blocked cards show the exact disabled reasons, and the merge endpoint recomputes
 before issuing any GitHub merge request. Once GitHub accepts the merge, the cockpit immediately
 updates local issue, run, and durable-session state to done/merged so the board does not wait for the
 next poll; closing the GitHub issue is attempted through the builder identity and recorded as part of
-the merge response. Active run rows include operator controls to request cancellation, rerun an
-issue, or stop a parked/running durable issue session. Those controls call the same JSON API used by
-tests; they are local trusted control-plane actions, not part of the worker prompt.
+the merge response. Done issue cards also show a compact merge audit line with tracker, issue
+snapshot, run-ledger, and durable-session reconciliation status plus a run-detail link. Active run
+rows include operator controls to request cancellation, rerun an issue, or stop a parked/running
+durable issue session. Those controls call the same JSON API used by tests; they are local trusted
+control-plane actions, not part of the worker prompt.
 Parked durable sessions are shown separately from active runs so `human-review` parking does not look
 like a failing or still-running worker.
 

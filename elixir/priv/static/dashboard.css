@@ -414,6 +414,22 @@ pre,
   line-height: 1.35;
 }
 
+.merge-audit {
+  margin: 0.18rem 0 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.merge-audit .mono {
+  color: var(--ink);
+}
+
+.merge-audit-link {
+  color: var(--accent-ink);
+  font-weight: 700;
+}
+
 .merge-action {
   padding: 0.27rem 0.62rem;
   color: var(--accent-ink);

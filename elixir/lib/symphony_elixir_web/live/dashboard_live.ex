@@ -356,6 +356,18 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         Disabled: <%= merge_gate_reasons(issue["merge_gate"]) %>
                       </p>
                     <% end %>
+                    <%= if issue["merge_audit"] do %>
+                      <p class="merge-audit">
+                        Merge audit:
+                        tracker <span class="mono"><%= merge_audit_result(issue["merge_audit"], "tracker") %></span>
+                        | snapshot <span class="mono"><%= merge_audit_result(issue["merge_audit"], "issue_snapshot") %></span>
+                        | run <span class="mono"><%= merge_audit_result(issue["merge_audit"], "run") %></span>
+                        | session <span class="mono"><%= merge_audit_result(issue["merge_audit"], "issue_session") %></span>
+                        <%= if present?(merge_audit_run_id(issue["merge_audit"])) do %>
+                          | <a class="merge-audit-link mono" href={"/api/v1/runs/#{merge_audit_run_id(issue["merge_audit"])}"} target="_blank" rel="noopener noreferrer">run detail</a>
+                        <% end %>
+                      </p>
+                    <% end %>
                   </article>
                 </div>
               </article>
@@ -726,6 +738,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp merge_gate_review_label(%{"review_stale" => true}), do: "autonomous: stale"
   defp merge_gate_review_label(_gate), do: nil
+
+  defp merge_audit_result(%{"post_merge_update" => post_merge_update}, key) when is_map(post_merge_update) do
+    Map.get(post_merge_update, key) || "n/a"
+  end
+
+  defp merge_audit_result(_audit, _key), do: "n/a"
+
+  defp merge_audit_run_id(%{"run_id" => run_id}) when is_binary(run_id), do: run_id
+  defp merge_audit_run_id(_audit), do: nil
 
   defp issue_columns do
     ["Todo", "In Progress", "Human Review", "Needs Input", "Blocked", "Rework", "Merging", "Done", "Backlog"]

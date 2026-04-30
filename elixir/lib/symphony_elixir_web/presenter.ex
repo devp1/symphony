@@ -95,9 +95,14 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp issues_payload(autonomous_reviews) when is_list(autonomous_reviews) do
     latest_reviews = latest_autonomous_reviews_by_issue(autonomous_reviews)
+    latest_merge_audits = latest_merge_audits_by_issue(Storage.list_runs(250))
 
     Storage.list_issues()
-    |> Enum.map(&put_merge_gate(&1, latest_reviews))
+    |> Enum.map(fn issue_snapshot ->
+      issue_snapshot
+      |> put_merge_gate(latest_reviews)
+      |> put_merge_audit(latest_merge_audits)
+    end)
   end
 
   @spec run_payload(String.t()) :: {:ok, map()} | {:error, :run_not_found}
@@ -175,6 +180,73 @@ defmodule SymphonyElixirWeb.Presenter do
       "pr_state" => Map.get(issue_snapshot, "pr_state"),
       "review_state" => Map.get(issue_snapshot, "review_state")
     })
+  end
+
+  defp put_merge_audit(%{} = issue_snapshot, latest_merge_audits) do
+    key = {Map.get(issue_snapshot, "repo_id"), normalize_issue_number(Map.get(issue_snapshot, "number"))}
+
+    case Map.get(latest_merge_audits, key) do
+      nil -> issue_snapshot
+      audit -> Map.put(issue_snapshot, "merge_audit", audit)
+    end
+  end
+
+  defp latest_merge_audits_by_issue(runs) do
+    Enum.reduce(runs, %{}, fn run, acc ->
+      key = {Map.get(run, "repo_id"), normalize_issue_number(Map.get(run, "issue_number"))}
+
+      cond do
+        not valid_issue_key?(key) ->
+          acc
+
+        Map.has_key?(acc, key) ->
+          acc
+
+        audit = merge_audit_from_run(run) ->
+          Map.put(acc, key, audit)
+
+        true ->
+          acc
+      end
+    end)
+  end
+
+  defp valid_issue_key?({repo_id, issue_number}) when is_binary(repo_id) and is_integer(issue_number), do: true
+  defp valid_issue_key?(_key), do: false
+
+  defp merge_audit_from_run(%{"id" => run_id} = run) when is_binary(run_id) do
+    case Storage.get_run(run_id) do
+      %{} = full_run ->
+        full_run
+        |> Map.get("events", [])
+        |> Enum.reverse()
+        |> Enum.find(&(Map.get(&1, "message") == "cockpit merge requested"))
+        |> merge_audit_payload(full_run, run)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp merge_audit_from_run(_run), do: nil
+
+  defp merge_audit_payload(nil, _full_run, _run), do: nil
+
+  defp merge_audit_payload(%{} = event, %{} = full_run, %{} = run) do
+    data = Map.get(event, "data") || %{}
+
+    %{
+      "run_id" => Map.get(full_run, "id") || Map.get(run, "id"),
+      "issue_session_id" => Map.get(full_run, "issue_session_id") || Map.get(run, "issue_session_id"),
+      "state" => Map.get(full_run, "state") || Map.get(run, "state"),
+      "session_state" => Map.get(full_run, "session_state") || Map.get(run, "session_state"),
+      "health" => Map.get(full_run, "health") || Map.get(run, "health") || [],
+      "event_level" => Map.get(event, "level"),
+      "event_message" => Map.get(event, "message"),
+      "event_inserted_at" => Map.get(event, "inserted_at"),
+      "merge_response" => Map.get(data, "merge_response"),
+      "post_merge_update" => Map.get(data, "post_merge_update") || %{}
+    }
   end
 
   defp normalize_issue_number(number) when is_integer(number), do: number

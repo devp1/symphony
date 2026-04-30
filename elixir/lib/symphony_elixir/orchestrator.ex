@@ -3187,6 +3187,7 @@ defmodule SymphonyElixir.Orchestrator do
         pr_url: issue.pr_url,
         head_sha: issue.head_sha,
         merge_gate_reasons: gate.reasons,
+        merge_response: merge_response,
         post_merge_update: post_merge_update
       })
 

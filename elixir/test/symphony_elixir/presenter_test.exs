@@ -97,6 +97,50 @@ defmodule SymphonyElixir.PresenterTest do
         review_state: "APPROVED"
       })
 
+    :ok =
+      SymphonyElixir.Storage.record_issue_snapshot(%{
+        repo_id: "beacon",
+        number: 28,
+        identifier: "GH-28",
+        title: "Merged PR",
+        state: "Done",
+        labels: ["symphony", "done"],
+        pr_url: "https://github.com/devp1/Beacon/pull/28",
+        head_sha: "merged-sha",
+        pr_state: "MERGED",
+        check_state: "passing",
+        review_state: "APPROVED"
+      })
+
+    assert {:ok, merged_run_id} =
+             SymphonyElixir.Storage.start_run(%{
+               id: "run-merged-pr",
+               repo_id: "beacon",
+               issue_number: 28,
+               issue_identifier: "GH-28",
+               issue_session_id: "issue-session-merged-pr",
+               state: "completed",
+               session_state: "stopped",
+               health: ["merged"],
+               pr_url: "https://github.com/devp1/Beacon/pull/28",
+               pr_state: "MERGED",
+               check_state: "passing",
+               review_state: "APPROVED"
+             })
+
+    :ok =
+      SymphonyElixir.Storage.append_event(merged_run_id, "info", "cockpit merge requested", %{
+        merge_response: %{"merged" => true},
+        post_merge_update: %{
+          tracker: ":ok",
+          issue_snapshot: ":ok",
+          run: ":ok",
+          issue_session: ":ok",
+          run_id: merged_run_id,
+          issue_session_id: "issue-session-merged-pr"
+        }
+      })
+
     assert {:ok, _} =
              SymphonyElixir.Storage.record_autonomous_review(%{
                id: "review-ready",
@@ -175,6 +219,24 @@ defmodule SymphonyElixir.PresenterTest do
            } = issues_by_identifier["GH-27"]["merge_gate"]
 
     assert "ci-not-green" in failing_reasons
+
+    assert %{
+             "run_id" => ^merged_run_id,
+             "issue_session_id" => "issue-session-merged-pr",
+             "state" => "completed",
+             "session_state" => "stopped",
+             "health" => ["merged"],
+             "event_message" => "cockpit merge requested",
+             "merge_response" => %{"merged" => true},
+             "post_merge_update" => %{
+               "tracker" => ":ok",
+               "issue_snapshot" => ":ok",
+               "run" => ":ok",
+               "issue_session" => ":ok",
+               "run_id" => ^merged_run_id,
+               "issue_session_id" => "issue-session-merged-pr"
+             }
+           } = issues_by_identifier["GH-28"]["merge_audit"]
   end
 
   defp running_entry(issue_id, identifier, session_state) do

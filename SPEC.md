@@ -1782,6 +1782,9 @@ Minimum endpoints:
     ledger, and durable session ledger to terminal merged/done state immediately, without waiting
     for the next tracker poll. Remote tracker closure may be best-effort, but local state MUST record
     enough detail for the cockpit to show whether that post-merge update succeeded.
+  - Successful responses SHOULD include both `merge_response` from GitHub and `post_merge_update`
+    status for the tracker, issue snapshot, run ledger, and durable-session ledger. The cockpit
+    SHOULD project that same audit record onto the issue card and link to the run detail ledger.
 
 - `POST /api/v1/issues/:repo_id/:number/stop-session`
   - Stops a running or parked durable issue session for local cleanup.

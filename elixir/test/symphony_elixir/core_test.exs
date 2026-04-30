@@ -2107,6 +2107,31 @@ defmodule SymphonyElixir.CoreTest do
                stale: false
              })
 
+    assert {:ok, issue_session_id} =
+             SymphonyElixir.Storage.start_issue_session(%{
+               id: "issue-session-merge-success",
+               repo_id: "beacon",
+               issue_number: 32,
+               issue_identifier: "GH-32",
+               current_run_id: "run-merge-success",
+               state: "parked"
+             })
+
+    assert {:ok, run_id} =
+             SymphonyElixir.Storage.start_run(%{
+               id: "run-merge-success",
+               repo_id: "beacon",
+               issue_number: 32,
+               issue_identifier: "GH-32",
+               issue_session_id: issue_session_id,
+               state: "parked",
+               session_state: "parked",
+               pr_url: "https://github.com/devp1/Beacon/pull/32",
+               pr_state: "OPEN",
+               check_state: "passing",
+               review_state: "APPROVED"
+             })
+
     parent = self()
 
     Application.put_env(:symphony_elixir, :github_command_fun, fn args, env ->
@@ -2117,18 +2142,59 @@ defmodule SymphonyElixir.CoreTest do
     on_exit(fn -> Application.delete_env(:symphony_elixir, :github_command_fun) end)
 
     state = %Orchestrator.State{
+      claimed: MapSet.new(["beacon#32", "32"]),
+      retry_attempts: %{"beacon#32" => %{attempt: 1}, "32" => %{attempt: 1}},
+      operator_paused_issue_ids: MapSet.new(["beacon#32", "32"]),
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
 
-    assert {:reply, {:ok, payload}, ^state} =
+    assert {:reply, {:ok, payload}, next_state} =
              Orchestrator.handle_call({:merge_issue_pr, "beacon", 32}, self(), state)
 
     assert payload.issue_identifier == "GH-32"
     assert payload.merge_response == %{"merged" => true}
+    assert payload.post_merge_update.tracker == ":ok"
+    assert payload.post_merge_update.issue_snapshot == ":ok"
+    assert payload.post_merge_update.run == ":ok"
+    assert payload.post_merge_update.issue_session == ":ok"
 
     assert_received {:gh_merge_args, args, [{"GH_TOKEN", "builder-token"}, {"GITHUB_TOKEN", "builder-token"}]}
     assert ["api", "repos/devp1/Beacon/pulls/32/merge" | _] = args
     assert "sha=def456" in args
+
+    assert_received {:gh_merge_args, ["api", "repos/devp1/Beacon/issues/32", "-X", "PATCH", "-f", "state=closed"],
+                     [
+                       {"GH_TOKEN", "builder-token"},
+                       {"GITHUB_TOKEN", "builder-token"}
+                     ]}
+
+    assert MapSet.member?(next_state.completed, "beacon#32")
+    assert MapSet.member?(next_state.completed, "32")
+    refute MapSet.member?(next_state.claimed, "beacon#32")
+    refute Map.has_key?(next_state.retry_attempts, "beacon#32")
+    refute MapSet.member?(next_state.operator_paused_issue_ids, "32")
+
+    assert %{
+             "state" => "completed",
+             "session_state" => "stopped",
+             "health" => ["merged"],
+             "pr_url" => "https://github.com/devp1/Beacon/pull/32",
+             "pr_state" => "MERGED",
+             "check_state" => "passing",
+             "review_state" => "APPROVED",
+             "events" => [%{"message" => "cockpit merge requested"}]
+           } = SymphonyElixir.Storage.get_run(run_id)
+
+    assert %{"state" => "stopped", "health" => ["merged"], "stop_reason" => "merged"} =
+             Enum.find(SymphonyElixir.Storage.list_issue_sessions(), &(&1["id"] == issue_session_id))
+
+    assert %{
+             "identifier" => "GH-32",
+             "state" => "Done",
+             "pr_state" => "MERGED",
+             "check_state" => "passing",
+             "review_state" => "APPROVED"
+           } = Enum.find(SymphonyElixir.Storage.list_issues(), &(&1["identifier"] == "GH-32"))
   end
 
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do

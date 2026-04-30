@@ -149,7 +149,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp latest_autonomous_reviews_by_issue(autonomous_reviews) do
     Enum.reduce(autonomous_reviews, %{}, fn review, acc ->
-      case {Map.get(review, "repo_id"), Map.get(review, "issue_number")} do
+      case {Map.get(review, "repo_id"), normalize_issue_number(Map.get(review, "issue_number"))} do
         {repo_id, issue_number} when is_binary(repo_id) and is_integer(issue_number) ->
           Map.put_new(acc, {repo_id, issue_number}, review)
 
@@ -160,8 +160,9 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp put_merge_gate(%{} = issue_snapshot, latest_reviews) do
-    review = Map.get(latest_reviews, {Map.get(issue_snapshot, "repo_id"), Map.get(issue_snapshot, "number")})
-    gate = AutonomousReview.merge_gate(AutonomousReview.issue_from_snapshot(issue_snapshot), review)
+    issue = AutonomousReview.issue_from_snapshot(issue_snapshot)
+    review = Map.get(latest_reviews, {issue.repo_id, issue.number})
+    gate = AutonomousReview.merge_gate(issue, review)
 
     Map.put(issue_snapshot, "merge_gate", %{
       "ready" => gate.ready?,
@@ -175,6 +176,17 @@ defmodule SymphonyElixirWeb.Presenter do
       "review_state" => Map.get(issue_snapshot, "review_state")
     })
   end
+
+  defp normalize_issue_number(number) when is_integer(number), do: number
+
+  defp normalize_issue_number(number) when is_binary(number) do
+    case Integer.parse(number) do
+      {parsed, ""} -> parsed
+      _ -> nil
+    end
+  end
+
+  defp normalize_issue_number(_number), do: nil
 
   defp running_entry_payload(entry) do
     %{

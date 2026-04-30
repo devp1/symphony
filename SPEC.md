@@ -1778,6 +1778,10 @@ Minimum endpoints:
     as `ci-not-green`, `autonomous-review-not-passing`, or `autonomous-review-stale`.
   - Local trusted GitHub implementations SHOULD use the builder GitHub identity for the merge and
     SHOULD pin the merge request to the reconciled PR head SHA when available.
+  - After GitHub accepts the merge, implementations SHOULD update their local issue snapshot, run
+    ledger, and durable session ledger to terminal merged/done state immediately, without waiting
+    for the next tracker poll. Remote tracker closure may be best-effort, but local state MUST record
+    enough detail for the cockpit to show whether that post-merge update succeeded.
 
 - `POST /api/v1/issues/:repo_id/:number/stop-session`
   - Stops a running or parked durable issue session for local cleanup.

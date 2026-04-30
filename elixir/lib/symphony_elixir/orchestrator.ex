@@ -3126,14 +3126,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_call({:merge_issue_pr, repo_id, number}, _from, state) do
-    reply =
+    {reply, state} =
       case merge_issue_pr_now(repo_id, number) do
         {:ok, payload} ->
+          state = mark_merged_issue_complete(state, Map.fetch!(payload, :repo_id), Map.fetch!(payload, :number))
           notify_dashboard()
-          {:ok, payload}
+          {{:ok, payload}, state}
 
         {:error, reason} ->
-          {:error, reason}
+          {{:error, reason}, state}
       end
 
     {:reply, reply, state}
@@ -3179,10 +3180,14 @@ defmodule SymphonyElixir.Orchestrator do
          gate = AutonomousReview.merge_gate(issue, latest_review),
          :ok <- ensure_merge_gate_ready(gate),
          {:ok, merge_response} <- GitHub.Client.merge_pull_request(issue) do
+      merged_issue = %{issue | state: "Done", pr_state: "MERGED"}
+      post_merge_update = persist_successful_merge(merged_issue)
+
       append_issue_event(issue, "info", "cockpit merge requested", %{
         pr_url: issue.pr_url,
         head_sha: issue.head_sha,
-        merge_gate_reasons: gate.reasons
+        merge_gate_reasons: gate.reasons,
+        post_merge_update: post_merge_update
       })
 
       {:ok,
@@ -3192,7 +3197,8 @@ defmodule SymphonyElixir.Orchestrator do
          issue_identifier: issue.identifier,
          pr_url: issue.pr_url,
          head_sha: issue.head_sha,
-         merge_response: merge_response
+         merge_response: merge_response,
+         post_merge_update: post_merge_update
        }}
     else
       {:error, {:merge_gate_blocked, reasons}} = error ->
@@ -3208,6 +3214,107 @@ defmodule SymphonyElixir.Orchestrator do
   defp ensure_merge_gate_ready(%{ready?: true}), do: :ok
   defp ensure_merge_gate_ready(%{reasons: reasons}), do: {:error, {:merge_gate_blocked, reasons}}
 
+  defp persist_successful_merge(%Issue{} = merged_issue) do
+    tracker_result = update_tracker_issue_done(merged_issue)
+    snapshot_result = Storage.record_issue_snapshot(issue_snapshot_attrs(merged_issue))
+    latest_run = latest_run_for_issue(merged_issue.repo_id, merged_issue.number)
+    run_result = persist_merged_run(latest_run, merged_issue)
+    issue_session_result = persist_merged_issue_session(latest_run)
+
+    result = %{
+      tracker: inspect(tracker_result),
+      issue_snapshot: inspect(snapshot_result),
+      run: inspect(run_result),
+      issue_session: inspect(issue_session_result),
+      run_id: latest_run && Map.get(latest_run, "id"),
+      issue_session_id: latest_run && Map.get(latest_run, "issue_session_id")
+    }
+
+    warn_if_post_merge_update_failed(merged_issue, result)
+    result
+  end
+
+  defp update_tracker_issue_done(%Issue{id: issue_id}) when is_binary(issue_id) do
+    Tracker.update_issue_state(issue_id, "Done")
+  end
+
+  defp persist_merged_run(%{"id" => run_id} = run, %Issue{} = merged_issue) when is_binary(run_id) do
+    Storage.update_run(run_id, %{
+      state: "completed",
+      issue_session_id: Map.get(run, "issue_session_id"),
+      session_state: "stopped",
+      health: ["merged"],
+      pr_url: merged_issue.pr_url,
+      pr_state: merged_issue.pr_state,
+      check_state: merged_issue.check_state,
+      review_state: merged_issue.review_state,
+      error: nil
+    })
+  end
+
+  defp persist_merged_run(_run, _merged_issue), do: :ok
+
+  defp persist_merged_issue_session(%{"issue_session_id" => issue_session_id} = run) when is_binary(issue_session_id) do
+    Storage.update_issue_session(issue_session_id, %{
+      state: "stopped",
+      current_run_id: Map.get(run, "id"),
+      health: ["merged"],
+      stop_reason: "merged"
+    })
+  end
+
+  defp persist_merged_issue_session(_run), do: :ok
+
+  defp warn_if_post_merge_update_failed(%Issue{} = issue, result) do
+    failed =
+      result
+      |> Map.take([:tracker, :issue_snapshot, :run, :issue_session])
+      |> Enum.reject(fn {_key, value} -> value == ":ok" end)
+
+    if failed != [] do
+      Logger.warning("Cockpit merge post-update was partially applied for #{issue_context(issue)}: #{inspect(Map.new(failed))}")
+    end
+  end
+
+  defp issue_snapshot_attrs(%Issue{} = issue) do
+    %{
+      repo_id: issue.repo_id,
+      number: issue.number,
+      identifier: issue.identifier,
+      title: issue.title,
+      state: issue.state,
+      url: issue.url,
+      labels: issue.labels,
+      pr_url: issue.pr_url,
+      head_sha: issue.head_sha,
+      pr_state: issue.pr_state,
+      check_state: issue.check_state,
+      review_state: issue.review_state
+    }
+  end
+
+  defp mark_merged_issue_complete(%State{} = state, repo_id, number) do
+    number = to_string(number)
+
+    ["#{repo_id}##{number}", number]
+    |> Enum.uniq()
+    |> Enum.reduce(state, fn issue_id, state_acc ->
+      state_acc
+      |> maybe_terminate_running_issue(issue_id)
+      |> clear_issue_runtime_state(issue_id)
+      |> complete_issue(issue_id)
+      |> clear_operator_pause(issue_id)
+    end)
+  end
+
+  defp maybe_terminate_running_issue(%State{} = state, issue_id) do
+    if Map.has_key?(state.running, issue_id), do: terminate_running_issue(state, issue_id, false), else: state
+  end
+
+  defp clear_operator_pause(%State{} = state, issue_id) do
+    %{state | operator_paused_issue_ids: MapSet.delete(state.operator_paused_issue_ids, issue_id)}
+  end
+
   defp stored_issue_snapshot(repo_id, number) do
     case Enum.find(Storage.list_issues(), &stored_issue_snapshot_match?(&1, repo_id, number)) do
       nil -> {:error, :issue_not_found}
@@ -3220,9 +3327,20 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp latest_autonomous_review_for_issue(repo_id, number) do
     Enum.find(Storage.list_autonomous_reviews(250), fn review ->
-      Map.get(review, "repo_id") == repo_id and Map.get(review, "issue_number") == number
+      Map.get(review, "repo_id") == repo_id and stored_issue_number(Map.get(review, "issue_number")) == number
     end)
   end
+
+  defp stored_issue_number(number) when is_integer(number), do: number
+
+  defp stored_issue_number(number) when is_binary(number) do
+    case Integer.parse(number) do
+      {parsed, ""} -> parsed
+      _ -> nil
+    end
+  end
+
+  defp stored_issue_number(_number), do: nil
 
   defp append_issue_event(%Issue{repo_id: repo_id, number: number}, level, message, data) do
     append_issue_event(repo_id, number, level, message, data)

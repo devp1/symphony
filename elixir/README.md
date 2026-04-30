@@ -113,6 +113,17 @@ tracker:
 github:
   builder_token: $SYMPHONY_GITHUB_BUILDER_TOKEN
   reviewer_token: $SYMPHONY_GITHUB_REVIEWER_TOKEN
+  # Prefer GitHub Apps for local dogfood so check-runs and approvals use
+  # independent identities. Symphony also auto-loads these canonical variables
+  # from ~/.config/symphony/github-apps/env when they are not already set.
+  # builder_app:
+  #   app_id: $SYMPHONY_GITHUB_BUILDER_APP_ID
+  #   installation_id: $SYMPHONY_GITHUB_BUILDER_INSTALLATION_ID
+  #   private_key_path: $SYMPHONY_GITHUB_BUILDER_PRIVATE_KEY_PATH
+  # reviewer_app:
+  #   app_id: $SYMPHONY_GITHUB_REVIEWER_APP_ID
+  #   installation_id: $SYMPHONY_GITHUB_REVIEWER_INSTALLATION_ID
+  #   private_key_path: $SYMPHONY_GITHUB_REVIEWER_PRIVATE_KEY_PATH
   review_check_name: symphony/autonomous-review
   required_check_names:
     - ci

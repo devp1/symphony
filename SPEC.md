@@ -658,6 +658,10 @@ not require recognizing or validating extension fields unless that extension is 
   `SYMPHONY_GITHUB_BUILDER_INSTALLATION_ID`, `SYMPHONY_GITHUB_BUILDER_PRIVATE_KEY_PATH`, and the
   matching `SYMPHONY_GITHUB_REVIEWER_*` names. Foundry-style `BUILDER_GITHUB_*` and
   `REVIEWER_GITHUB_*` names are accepted as fallbacks.
+  For local trusted dogfood, Symphony also auto-loads the canonical `SYMPHONY_GITHUB_*`
+  variables from `~/.config/symphony/github-apps/env` when they are not already present in the
+  process environment. This local env file is intentionally narrow and should contain only App IDs,
+  installation IDs, and private-key paths for the builder/reviewer Apps.
 - `github.review_check_name`: string, default `symphony/autonomous-review`
 - `github.required_check_names`: list of strings, default `[]`; named CI checks the cockpit merge
   gate requires in addition to the autonomous review check. When non-empty, successful

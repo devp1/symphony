@@ -31,6 +31,8 @@ defmodule SymphonyElixir.Config do
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
+    :ok = SymphonyElixir.LocalEnv.load_default_github_app_env()
+
     case Workflow.current() do
       {:ok, %{config: config}} when is_map(config) ->
         Schema.parse(config)

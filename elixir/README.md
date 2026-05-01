@@ -144,6 +144,20 @@ hooks:
       git switch "$branch" 2>/dev/null || git switch -c "$branch"
     fi
 agent:
+  default_provider: codex
+  profiles:
+    planner:
+      provider: codex
+    executor:
+      provider: codex
+    reviewer:
+      provider: codex
+  routes:
+    - labels: [claude-dogfood]
+      executor:
+        provider: claude_code
+        model: sonnet
+        effort: high
   max_concurrent_agents: 10
   max_turns: 20
   artifact_nudge_tokens: 250000
@@ -160,6 +174,11 @@ codex:
   command: codex --config shell_environment_policy.inherit=all app-server
   approval_policy: never
   semantic_inactivity_timeout_ms: 1800000
+claude_code:
+  command: claude
+  permission_mode: bypassPermissions
+  setting_sources: user,project,local
+  extra_args: []
 storage:
   sqlite_path: ./symphony.sqlite3
 ---
@@ -172,6 +191,14 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- `agent.default_provider` selects the coding-agent provider when a repo does not override it.
+  Supported values are `codex` and `claude_code`; the default is `codex`. GitHub `repos[]` entries
+  may set `agent_provider` to choose per repository, so existing Codex work can stay unchanged while
+  a smaller local dogfood repo uses Claude Code.
+- `agent.profiles` lets planner, executor, and reviewer phases choose providers independently.
+  `agent.routes` applies label/task-set overrides per phase, so a repo can keep Codex as its default
+  executor while sending `claude-dogfood` tasks through Claude Code with a task-appropriate model or
+  effort.
 - Prefer `github.builder_app` and `github.reviewer_app` for the full independent-review path. Each
   block takes `app_id`, `installation_id`, and either `private_key_path` or `private_key`; the
   checked-in `github-builder-app-manifest.json` and `github-reviewer-app-manifest.json` files are
@@ -209,6 +236,16 @@ Notes:
   Codex unchanged. With `runtime_profile: local_trusted`, omitted local turn policy resolves to
   `{"type":"dangerFullAccess"}`. Explicit `dangerFullAccess` stays minimal; explicit workspace
   policies still force network access and include the issue workspace in `writableRoots`.
+- `claude_code` config is used only when the resolved provider is `claude_code`. It is local-only in
+  this implementation and uses the user's normal Claude Code OAuth/keychain login; Symphony does not
+  use `--bare` or `ANTHROPIC_API_KEY` for this path. The adapter runs
+  `claude -p --verbose --output-format stream-json --input-format text --permission-mode <mode>
+  --session-id <uuid>` with the rendered Symphony prompt on stdin. `claude_code.model` is optional,
+  `permission_mode` defaults to `bypassPermissions`, `setting_sources` defaults to
+  `user,project,local`, and `extra_args` appends additional CLI flags.
+- The task planning lane is exposed through `/api/v1/goals` and `/api/v1/task-runs/*`. Native goals
+  stay local until a `ready_for_approval` planning manifest is approved; approval snapshots the plan,
+  creates or links the GitHub issue, and publishes the approved plan comment before execution.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   active work cycle when a turn completes normally but the issue is still in an active state.
   Default: `20`. Local trusted sessions park at that boundary and can resume the same thread.

@@ -156,20 +156,23 @@ defmodule SymphonyElixir.Config.Schema do
     import Ecto.Changeset
 
     @primary_key false
+    @agent_providers ["codex", "claude_code"]
     embedded_schema do
       field(:id, :string)
       field(:owner, :string)
       field(:name, :string)
       field(:clone_url, :string)
       field(:workspace_root, :string)
+      field(:agent_provider, :string)
       field(:labels, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:id, :owner, :name, :clone_url, :workspace_root, :labels], empty_values: [])
+      |> cast(attrs, [:id, :owner, :name, :clone_url, :workspace_root, :agent_provider, :labels], empty_values: [])
       |> validate_required([:owner, :name])
+      |> validate_inclusion(:agent_provider, @agent_providers)
     end
   end
 
@@ -235,7 +238,12 @@ defmodule SymphonyElixir.Config.Schema do
     alias SymphonyElixir.Config.Schema
 
     @primary_key false
+    @agent_providers ["codex", "claude_code"]
+    @agent_phases ["planner", "executor", "reviewer"]
     embedded_schema do
+      field(:default_provider, :string, default: "codex")
+      field(:profiles, :map, default: %{})
+      field(:routes, {:array, :map}, default: [])
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
@@ -252,6 +260,9 @@ defmodule SymphonyElixir.Config.Schema do
       |> cast(
         attrs,
         [
+          :default_provider,
+          :profiles,
+          :routes,
           :max_concurrent_agents,
           :max_turns,
           :max_retry_backoff_ms,
@@ -263,6 +274,11 @@ defmodule SymphonyElixir.Config.Schema do
         ],
         empty_values: []
       )
+      |> validate_inclusion(:default_provider, @agent_providers)
+      |> update_change(:profiles, &normalize_profiles/1)
+      |> update_change(:routes, &normalize_routes/1)
+      |> validate_profiles(:profiles)
+      |> validate_routes(:routes)
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
@@ -272,6 +288,136 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_tokens_without_artifact, greater_than_or_equal_to: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
+    end
+
+    defp normalize_profiles(nil), do: %{}
+
+    defp normalize_profiles(profiles) when is_map(profiles) do
+      profiles
+      |> Schema.normalize_keys()
+      |> Enum.reduce(%{}, fn {phase, profile}, acc ->
+        if phase in @agent_phases and is_map(profile) do
+          Map.put(acc, phase, normalize_profile(profile))
+        else
+          acc
+        end
+      end)
+    end
+
+    defp normalize_profiles(_profiles), do: %{}
+
+    defp normalize_routes(nil), do: []
+
+    defp normalize_routes(routes) when is_list(routes) do
+      routes
+      |> Enum.map(&Schema.normalize_keys/1)
+      |> Enum.filter(&is_map/1)
+      |> Enum.map(&normalize_route/1)
+    end
+
+    defp normalize_routes(_routes), do: []
+
+    defp normalize_route(route) do
+      labels =
+        route
+        |> Map.get("labels", [])
+        |> List.wrap()
+        |> Enum.map(&to_string/1)
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
+
+      profiles =
+        Enum.reduce(@agent_phases, %{}, fn phase, acc ->
+          case Map.get(route, phase) do
+            profile when is_map(profile) -> Map.put(acc, phase, normalize_profile(profile))
+            _other -> acc
+          end
+        end)
+
+      route
+      |> Map.take(["name"])
+      |> Map.put("labels", labels)
+      |> Map.merge(profiles)
+    end
+
+    defp normalize_profile(profile) when is_map(profile) do
+      profile
+      |> Schema.normalize_keys()
+      |> Map.take(["provider", "model", "effort", "permission_mode", "extra_args"])
+      |> Enum.reduce(%{}, fn
+        {"extra_args", args}, acc ->
+          Map.put(acc, "extra_args", normalize_extra_args(args))
+
+        {key, value}, acc when is_binary(value) ->
+          trimmed = String.trim(value)
+          if trimmed == "", do: acc, else: Map.put(acc, key, trimmed)
+
+        {_key, _value}, acc ->
+          acc
+      end)
+    end
+
+    defp normalize_extra_args(args) when is_list(args) do
+      args
+      |> Enum.map(&to_string/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+    end
+
+    defp normalize_extra_args(_args), do: []
+
+    defp validate_profiles(changeset, field) do
+      validate_change(changeset, field, fn ^field, profiles ->
+        profiles
+        |> Enum.flat_map(fn {phase, profile} -> profile_errors(field, "profiles.#{phase}", profile) end)
+      end)
+    end
+
+    defp validate_routes(changeset, field) do
+      validate_change(changeset, field, fn ^field, routes ->
+        routes
+        |> Enum.with_index()
+        |> Enum.flat_map(&route_errors(field, &1))
+      end)
+    end
+
+    defp route_errors(field, {route, index}) do
+      route_label_errors(field, route, index) ++
+        route_profile_presence_errors(field, route, index) ++
+        route_phase_errors(field, route, index)
+    end
+
+    defp route_phase_errors(field, route, index) do
+      Enum.flat_map(@agent_phases, fn phase ->
+        case Map.get(route, phase) do
+          profile when is_map(profile) -> profile_errors(field, "routes[#{index}].#{phase}", profile)
+          _other -> []
+        end
+      end)
+    end
+
+    defp route_label_errors(field, route, index) do
+      if Map.get(route, "labels", []) == [] do
+        [{field, "routes[#{index}].labels must include at least one label"}]
+      else
+        []
+      end
+    end
+
+    defp route_profile_presence_errors(field, route, index) do
+      if Enum.any?(@agent_phases, &is_map(Map.get(route, &1))) do
+        []
+      else
+        [{field, "routes[#{index}] must configure at least one phase profile"}]
+      end
+    end
+
+    defp profile_errors(field, path, profile) do
+      case Map.get(profile, "provider") do
+        nil -> []
+        provider when provider in @agent_providers -> []
+        provider -> [{field, "#{path}.provider #{inspect(provider)} is invalid"}]
+      end
     end
   end
 
@@ -325,6 +471,38 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
     end
+  end
+
+  defmodule ClaudeCode do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:command, :string, default: "claude")
+      field(:model, :string)
+      field(:permission_mode, :string, default: "bypassPermissions")
+      field(:setting_sources, :string, default: "user,project,local")
+      field(:extra_args, {:array, :string}, default: [])
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:command, :model, :permission_mode, :setting_sources, :extra_args], empty_values: [])
+      |> validate_required([:command, :permission_mode, :setting_sources])
+      |> update_change(:extra_args, &normalize_extra_args/1)
+    end
+
+    defp normalize_extra_args(args) when is_list(args) do
+      args
+      |> Enum.map(&to_string/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+    end
+
+    defp normalize_extra_args(_args), do: []
   end
 
   defmodule Hooks do
@@ -451,6 +629,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:claude_code, ClaudeCode, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:evidence, Evidence, on_replace: :update, defaults_to_struct: true)
@@ -562,6 +741,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:claude_code, with: &ClaudeCode.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:evidence, with: &Evidence.changeset/2)
@@ -646,6 +826,7 @@ defmodule SymphonyElixir.Config.Schema do
         name: name,
         clone_url: repo.clone_url || "https://github.com/#{owner}/#{name}.git",
         workspace_root: resolve_path_value(repo.workspace_root, Path.join(default_workspace_root, id)),
+        agent_provider: repo.agent_provider,
         labels: Map.merge(@default_github_labels, normalize_keys(repo.labels || %{}))
     }
   end
@@ -658,14 +839,16 @@ defmodule SymphonyElixir.Config.Schema do
     |> String.trim("-")
   end
 
-  defp normalize_keys(value) when is_map(value) do
+  @doc false
+  @spec normalize_keys(term()) :: term()
+  def normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->
       Map.put(normalized, normalize_key(key), normalize_keys(raw_value))
     end)
   end
 
-  defp normalize_keys(value) when is_list(value), do: Enum.map(value, &normalize_keys/1)
-  defp normalize_keys(value), do: value
+  def normalize_keys(value) when is_list(value), do: Enum.map(value, &normalize_keys/1)
+  def normalize_keys(value), do: value
 
   defp normalize_optional_map(nil), do: nil
   defp normalize_optional_map(value) when is_map(value), do: normalize_keys(value)
@@ -924,7 +1107,10 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp flatten_errors(errors, prefix) when is_list(errors) do
-    Enum.map(errors, &(prefix <> " " <> &1))
+    Enum.flat_map(errors, fn
+      error when is_binary(error) -> [prefix <> " " <> error]
+      nested -> flatten_errors(nested, prefix)
+    end)
   end
 
   defp translate_error({message, options}) do

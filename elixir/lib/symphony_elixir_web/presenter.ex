@@ -28,6 +28,7 @@ defmodule SymphonyElixirWeb.Presenter do
           evidence_bundles: Storage.list_evidence_bundles(50),
           evidence_reviews: Storage.list_evidence_reviews(100),
           autonomous_reviews: autonomous_reviews,
+          task_runs: Storage.list_task_runs(50),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           repos: repos_payload(),
           issues: issues_payload(autonomous_reviews),

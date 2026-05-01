@@ -206,7 +206,7 @@ Examples:
 - workspace root
 - active and terminal issue states
 - concurrency limits
-- coding-agent executable/args/timeouts
+- coding-agent provider selection and executable/args/timeouts
 - workspace hooks
 
 #### 4.1.4 Workspace
@@ -367,6 +367,7 @@ Top-level keys:
 - `hooks`
 - `agent`
 - `codex`
+- `claude_code`
 
 Unknown keys SHOULD be ignored for forward compatibility.
 
@@ -396,7 +397,8 @@ Fields:
   - Legacy single-repository GitHub configuration for `tracker.kind == "github"`.
 - `repos` (top-level list)
   - Preferred GitHub configuration. Each entry includes `id`, `owner`, `name`, optional
-    `clone_url`, optional `workspace_root`, and optional label overrides.
+    `clone_url`, optional `workspace_root`, optional `agent_provider`, and optional label
+    overrides.
 - `active_states` (list of strings)
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings)
@@ -448,6 +450,25 @@ Fields:
 
 Fields:
 
+- `default_provider` (string)
+  - Default: `codex`
+  - Supported values: `codex`, `claude_code`
+  - Used when an issue's repository does not set `repos[].agent_provider`.
+  - Invalid values fail configuration validation.
+- `profiles` (object)
+  - Default: empty map.
+  - Optional phase defaults keyed by `planner`, `executor`, and `reviewer`.
+  - Each profile may set `provider`, `model`, `effort`, `permission_mode`, and `extra_args`.
+  - Profile `provider` values use the same provider enum as `default_provider`.
+  - Missing phase profile fields fall back to `agent.default_provider`; for executor only,
+    `repos[].agent_provider` may override the global default.
+- `routes` (list of objects)
+  - Default: empty list.
+  - Each route matches issue labels and may provide phase-specific `planner`, `executor`, or
+    `reviewer` profile overrides.
+  - A route with `labels: ["claude-dogfood"]` applies when the issue has that label. Multiple
+    labels are an all-label match.
+  - The first matching route wins; route profile fields override phase defaults for that phase.
 - `max_concurrent_agents` (integer)
   - Default: `10`
   - Changes SHOULD be re-applied at runtime and affect subsequent dispatch decisions.
@@ -515,6 +536,41 @@ fields locally if they want stricter startup checks.
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
+
+#### 5.3.7 `claude_code` (object)
+
+Fields:
+
+- `command` (string shell command)
+  - Default: `claude`
+  - The runtime resolves the executable locally and runs Claude Code in the issue workspace.
+- `model` (string, OPTIONAL)
+  - Default: omitted.
+  - When present, passed as `--model <model>`.
+- `permission_mode` (string)
+  - Default: `bypassPermissions`
+  - Passed as `--permission-mode <value>`.
+- `setting_sources` (string)
+  - Default: `user,project,local`
+  - Passed as `--setting-sources <value>` so local OAuth/keychain and project settings can be used.
+- `extra_args` (list of strings)
+  - Default: `[]`
+  - Appended after Symphony-managed arguments.
+
+Runtime requirements:
+
+- The `claude_code` provider is local-only for v1. Remote SSH workers MUST fail with a clear
+  unsupported-provider error.
+- A turn MUST run Claude Code as:
+  `claude -p --verbose --output-format stream-json --input-format text --permission-mode <mode> --session-id <uuid> ...`
+- Implementations MUST NOT pass `--bare`, because local OAuth/keychain authentication is required.
+- The rendered Symphony prompt MUST be passed on stdin, not as shell argv.
+- Stream JSON lines SHOULD be normalized into `claude/event/*` updates through the same
+  `on_message` callback path used by other coding-agent adapters.
+- A `type=result` event with `is_error=false` is success. `is_error=true`, process exit, malformed
+  JSON, auth failure, and timeout are agent errors.
+- The durable Claude session UUID SHOULD be stored in existing session/thread identifiers rather
+  than requiring a schema migration.
 
 ### 5.4 Prompt Template Contract
 
@@ -643,6 +699,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
 - `repos`: list of GitHub repository configs when `tracker.kind=github`; preferred over legacy
   `tracker.owner` / `tracker.repo`
+- `repos[].agent_provider`: optional coding-agent provider override; supported values are `codex`
+  and `claude_code`
 - `github.builder_token`: optional string or `$VAR`; token for the GitHub builder identity that
   owns issue labels/comments, branch updates, PR creation, and normal worker handoff
 - `github.reviewer_token`: optional string or `$VAR`; token for the independent GitHub reviewer
@@ -675,6 +733,9 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
+- `agent.default_provider`: string, default `codex`; supported values are `codex` and `claude_code`
+- `agent.profiles`: map of phase defaults for `planner`, `executor`, and `reviewer`
+- `agent.routes`: list of label-matched phase profile overrides
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
@@ -691,6 +752,11 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.semantic_inactivity_timeout_ms`: integer, default `1800000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `claude_code.command`: shell command string, default `claude`
+- `claude_code.model`: optional model string, default omitted
+- `claude_code.permission_mode`: string, default `bypassPermissions`
+- `claude_code.setting_sources`: string, default `user,project,local`
+- `claude_code.extra_args`: list of strings, default `[]`
 - `evidence.enabled`: boolean, default `true`
 - `evidence.force_labels`: list of issue labels that require an evidence bundle, default
   `["evidence-required"]`
@@ -990,7 +1056,55 @@ Part E: Autonomous PR review and merge gate
   `pass`, and that review is not stale relative to the current PR head SHA. V1 may enforce this in
   cockpit merge actions before branch protection is configured.
 
-### 8.6 Startup Terminal Workspace Cleanup
+### 8.6 Task Planning Pipeline
+
+Implementations MAY expose an opt-in task planning pipeline in parallel with direct issue execution.
+This pipeline generalizes the planner -> approval -> executor -> PR reviewer flow while preserving
+existing GitHub issue automation.
+
+`TaskRun` states:
+
+- `planning_queued`
+- `planning_agent`
+- `awaiting_input`
+- `awaiting_approval`
+- `approved`
+- `implementing`
+- `self_testing`
+- `opening_pr`
+- `pr_reviewing`
+- `completed`
+- Terminal failure/cancel/stale states such as `failed`, `cancelled`, or `stale`
+
+Structured artifacts:
+
+- `planning_manifest`: planner output with `status`, `summary`, `questions`, `plan_markdown`,
+  `acceptance_criteria`, `test_plan`, `risks`, `out_of_scope`, and proposed agent profiles.
+- `approved_plan`: immutable copy of the approved planning manifest.
+- `implementation_manifest`: executor output describing changes, validation, PR title/body, and
+  readiness.
+- `review_manifest`: independent PR reviewer verdict, findings, and evidence.
+
+Native goal intake:
+
+- Native goals store raw goal text, optional repo hint/repo id, labels/tags, and creator notes in
+  local storage.
+- Native goals MUST NOT create GitHub issues before plan approval.
+- A planner may return `needs_input` with concise questions, moving the task run to
+  `awaiting_input`.
+- Submitted answers move the task back to `planning_queued` for replanning.
+- Approving a `ready_for_approval` planning manifest snapshots it to `approved_plan`, creates or
+  links the GitHub issue, and publishes an approved-plan issue comment.
+
+Phase routing:
+
+- Planner, executor, and PR reviewer SHOULD resolve independently through `agent.profiles` and
+  `agent.routes`.
+- Provider/model/effort/permission settings MAY differ by phase and label/task set.
+- Existing direct GitHub issue execution remains available; the approval-gated pipeline is opt-in
+  until a repository explicitly adopts it.
+
+### 8.7 Startup Terminal Workspace Cleanup
 
 When the service starts:
 
@@ -1310,6 +1424,8 @@ Timeouts:
 - `codex.turn_timeout_ms`: total turn stream timeout
 - `codex.semantic_inactivity_timeout_ms`: hard stuck-run guard reset by meaningful Codex activity
 - `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
+- `claude_code` turns reuse `codex.turn_timeout_ms` and `codex.stall_timeout_ms` unless a future
+  provider-specific timeout block is added.
 
 Error mapping (RECOMMENDED normalized categories):
 
@@ -1381,8 +1497,8 @@ GitHub-specific requirements for `tracker.kind == "github"`:
 
 - `tracker.kind == "github"`
 - Preferred configuration is the top-level `repos` list.
-- Each repo entry MUST include `owner` and `name`; `id`, `clone_url`, `workspace_root`, and labels
-  MAY be defaulted by the config layer.
+- Each repo entry MUST include `owner` and `name`; `id`, `clone_url`, `workspace_root`,
+  `agent_provider`, and labels MAY be defaulted by the config layer.
 - Candidate issue fetch SHOULD use labels as the durable state machine.
 - Claim/reconcile behavior SHOULD preserve GitHub as the source of truth for issue and PR state.
 - Pull request URL, head SHA, checks, and review status SHOULD be reconciled into the local run
@@ -1703,6 +1819,33 @@ Minimum endpoints:
 - `GET /api/v1/runs/:run_id`
   - Returns persisted run details, including issue session identity, Codex thread/session telemetry,
     run events, artifacts, warnings, latest error, and reconciled PR metadata when present.
+
+- `GET /api/v1/task-runs`
+  - Returns persisted task planning runs, including local native goals and GitHub issue planning
+    runs.
+
+- `POST /api/v1/goals`
+  - Creates a native local goal with `goal_text`, optional `repo_id` or `repo_hint`, optional
+    `labels`, and optional `creator_notes`.
+  - The response includes the local task run. No GitHub issue is created by this endpoint.
+
+- `GET /api/v1/task-runs/:task_run_id`
+  - Returns a single task run with its event log.
+
+- `POST /api/v1/task-runs/:task_run_id/plan`
+  - Runs the planner for a task run in `planning_queued` or `planning_agent`.
+  - A `needs_input` manifest moves the run to `awaiting_input`; a `ready_for_approval` manifest
+    moves it to `awaiting_approval`.
+
+- `POST /api/v1/task-runs/:task_run_id/answers`
+  - Accepts planner question answers and moves an `awaiting_input` run back to `planning_queued`.
+
+- `POST /api/v1/task-runs/:task_run_id/approve-plan`
+  - Approves the latest ready planning manifest, snapshots it to `approved_plan`, creates or links
+    the GitHub issue, and publishes an approved-plan comment.
+
+- `POST /api/v1/task-runs/:task_run_id/rerun-plan`
+  - Queues replanning, optionally with an operator note.
 
 - `GET /api/v1/<issue_identifier>`
   - Returns issue-specific runtime/debug details for the identified issue, including any information

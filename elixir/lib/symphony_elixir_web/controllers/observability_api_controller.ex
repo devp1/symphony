@@ -6,7 +6,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
-  alias SymphonyElixir.Orchestrator
+  alias SymphonyElixir.{Orchestrator, Storage, TaskRuns}
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
@@ -22,6 +22,32 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   @spec issues(Conn.t(), map()) :: Conn.t()
   def issues(conn, _params) do
     json(conn, %{issues: Presenter.issues_payload()})
+  end
+
+  @spec task_runs(Conn.t(), map()) :: Conn.t()
+  def task_runs(conn, _params) do
+    json(conn, %{task_runs: Storage.list_task_runs(100)})
+  end
+
+  @spec task_run(Conn.t(), map()) :: Conn.t()
+  def task_run(conn, %{"task_run_id" => task_run_id}) do
+    case Storage.get_task_run(task_run_id) do
+      %{} = task_run -> json(conn, %{task_run: task_run})
+      _ -> error_response(conn, 404, "task_run_not_found", "Task run not found")
+    end
+  end
+
+  @spec create_goal(Conn.t(), map()) :: Conn.t()
+  def create_goal(conn, params) do
+    case TaskRuns.create_goal(params) do
+      {:ok, task_run} ->
+        conn
+        |> put_status(201)
+        |> json(%{task_run: task_run})
+
+      {:error, reason} ->
+        error_response(conn, 422, "goal_create_failed", "Goal create failed: #{inspect(reason)}")
+    end
   end
 
   @spec readiness(Conn.t(), map()) :: Conn.t()
@@ -65,6 +91,66 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
       {:error, :unavailable} ->
         error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+    end
+  end
+
+  @spec run_task_planning(Conn.t(), map()) :: Conn.t()
+  def run_task_planning(conn, %{"task_run_id" => task_run_id}) do
+    case TaskRuns.run_planning(task_run_id) do
+      {:ok, task_run} ->
+        conn
+        |> put_status(202)
+        |> json(%{task_run: task_run, ok: true, action: "planning_completed"})
+
+      {:error, :task_run_not_found} ->
+        error_response(conn, 404, "task_run_not_found", "Task run not found")
+
+      {:error, reason} ->
+        error_response(conn, 422, "planning_failed", "Planning failed: #{inspect(reason)}")
+    end
+  end
+
+  @spec submit_task_answers(Conn.t(), map()) :: Conn.t()
+  def submit_task_answers(conn, %{"task_run_id" => task_run_id} = params) do
+    answers = if is_list(params["answers"]), do: params["answers"], else: []
+
+    case TaskRuns.submit_answers(task_run_id, answers) do
+      {:ok, task_run} ->
+        json(conn, %{task_run: task_run, ok: true, action: "answers_submitted"})
+
+      {:error, :task_run_not_found} ->
+        error_response(conn, 404, "task_run_not_found", "Task run not found")
+
+      {:error, reason} ->
+        error_response(conn, 422, "answers_failed", "Answers failed: #{inspect(reason)}")
+    end
+  end
+
+  @spec approve_task_plan(Conn.t(), map()) :: Conn.t()
+  def approve_task_plan(conn, %{"task_run_id" => task_run_id}) do
+    case TaskRuns.approve_plan(task_run_id) do
+      {:ok, task_run} ->
+        json(conn, %{task_run: task_run, ok: true, action: "plan_approved"})
+
+      {:error, :task_run_not_found} ->
+        error_response(conn, 404, "task_run_not_found", "Task run not found")
+
+      {:error, reason} ->
+        error_response(conn, 422, "approve_plan_failed", "Plan approval failed: #{inspect(reason)}")
+    end
+  end
+
+  @spec rerun_task_plan(Conn.t(), map()) :: Conn.t()
+  def rerun_task_plan(conn, %{"task_run_id" => task_run_id} = params) do
+    case TaskRuns.rerun_plan(task_run_id, params["note"]) do
+      {:ok, task_run} ->
+        json(conn, %{task_run: task_run, ok: true, action: "replanning_queued"})
+
+      {:error, :task_run_not_found} ->
+        error_response(conn, 404, "task_run_not_found", "Task run not found")
+
+      {:error, reason} ->
+        error_response(conn, 422, "rerun_plan_failed", "Replanning failed: #{inspect(reason)}")
     end
   end
 

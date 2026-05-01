@@ -25,6 +25,15 @@ defmodule SymphonyElixir.Config do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map()
         }
+  @type agent_provider :: String.t()
+  @type agent_phase :: :planner | :executor | :reviewer | String.t()
+  @type agent_profile :: %{
+          required(:provider) => agent_provider(),
+          optional(:model) => String.t(),
+          optional(:effort) => String.t(),
+          optional(:permission_mode) => String.t(),
+          optional(:extra_args) => [String.t()]
+        }
 
   @type github_role :: :builder | :reviewer | :operator
   @type github_auth :: {:app, map()} | {:token, String.t()} | nil
@@ -80,6 +89,104 @@ defmodule SymphonyElixir.Config do
   def primary_repo do
     List.first(repos())
   end
+
+  @spec agent_provider_for_issue(map() | nil) :: agent_provider()
+  def agent_provider_for_issue(issue), do: agent_profile_for_issue(issue, :executor).provider
+
+  @spec agent_provider_for_repo_id(String.t() | nil) :: agent_provider()
+  def agent_provider_for_repo_id(repo_id) when is_binary(repo_id) do
+    agent_provider_for_issue(%{repo_id: repo_id})
+  end
+
+  def agent_provider_for_repo_id(_repo_id), do: settings!().agent.default_provider
+
+  @spec agent_profile_for_issue(map() | nil, agent_phase()) :: agent_profile()
+  def agent_profile_for_issue(issue, phase) do
+    settings = settings!()
+    phase = normalize_agent_phase(phase)
+
+    settings
+    |> routed_agent_profile(issue, phase)
+    |> merge_agent_profile(default_agent_profile(settings, issue, phase))
+  end
+
+  @spec agent_profile_for_repo_id(String.t() | nil, agent_phase()) :: agent_profile()
+  def agent_profile_for_repo_id(repo_id, phase) when is_binary(repo_id) do
+    agent_profile_for_issue(%{repo_id: repo_id, labels: []}, phase)
+  end
+
+  def agent_profile_for_repo_id(_repo_id, phase), do: agent_profile_for_issue(nil, phase)
+
+  defp routed_agent_profile(settings, issue, phase) do
+    labels =
+      issue
+      |> issue_labels()
+      |> MapSet.new()
+
+    settings.agent.routes
+    |> Enum.find_value(%{}, fn route ->
+      route_labels = Map.get(route, "labels", [])
+
+      if route_labels != [] and Enum.all?(route_labels, &MapSet.member?(labels, &1)) do
+        route |> Map.get(Atom.to_string(phase), %{}) |> atomize_profile()
+      end
+    end)
+  end
+
+  defp default_agent_profile(settings, issue, phase) do
+    profiles = settings.agent.profiles || %{}
+    phase_profile = profiles |> Map.get(Atom.to_string(phase), %{}) |> atomize_profile()
+    provider = profile_provider(phase_profile) || repo_agent_provider(settings, issue, phase) || settings.agent.default_provider
+
+    phase_profile
+    |> Map.put(:provider, provider)
+  end
+
+  defp merge_agent_profile(profile, defaults) when is_map(profile) do
+    profile
+    |> atomize_profile()
+    |> Map.merge(defaults, fn _key, value, _default -> value end)
+    |> Map.put_new(:provider, defaults.provider)
+  end
+
+  defp repo_agent_provider(settings, %{repo_id: repo_id}, :executor) when is_binary(repo_id) do
+    settings.repos
+    |> Enum.find(&(&1.id == repo_id))
+    |> case do
+      %{agent_provider: provider} when is_binary(provider) and provider != "" -> provider
+      _ -> nil
+    end
+  end
+
+  defp repo_agent_provider(_settings, _issue, _phase), do: nil
+
+  defp profile_provider(%{provider: provider}) when is_binary(provider) and provider != "", do: provider
+  defp profile_provider(_profile), do: nil
+
+  defp atomize_profile(profile) when is_map(profile) do
+    Enum.reduce(profile, %{}, fn
+      {key, value}, acc when key in [:provider, :model, :effort, :permission_mode, :extra_args] ->
+        Map.put(acc, key, value)
+
+      {key, value}, acc when key in ["provider", "model", "effort", "permission_mode", "extra_args"] ->
+        Map.put(acc, String.to_existing_atom(key), value)
+
+      {_key, _value}, acc ->
+        acc
+    end)
+  end
+
+  defp atomize_profile(_profile), do: %{}
+
+  defp normalize_agent_phase(phase) when phase in [:planner, :executor, :reviewer], do: phase
+  defp normalize_agent_phase("planner"), do: :planner
+  defp normalize_agent_phase("executor"), do: :executor
+  defp normalize_agent_phase("reviewer"), do: :reviewer
+  defp normalize_agent_phase(_phase), do: :executor
+
+  defp issue_labels(%{labels: labels}) when is_list(labels), do: Enum.map(labels, &to_string/1)
+  defp issue_labels(%{"labels" => labels}) when is_list(labels), do: Enum.map(labels, &to_string/1)
+  defp issue_labels(_issue), do: []
 
   @spec github_token(github_role()) :: String.t() | nil
   def github_token(:builder), do: settings!().github.builder_token

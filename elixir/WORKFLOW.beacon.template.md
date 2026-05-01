@@ -34,6 +34,7 @@ hooks:
       fi
     fi
 agent:
+  default_provider: codex
   max_concurrent_agents: 1
   max_turns: 8
   artifact_nudge_tokens: 150000
@@ -52,6 +53,11 @@ codex:
   command: codex --config shell_environment_policy.inherit=all app-server
   approval_policy: on-request
   thread_sandbox: workspace-write
+claude_code:
+  command: claude
+  permission_mode: bypassPermissions
+  setting_sources: user,project,local
+  extra_args: []
 ---
 
 You are working on a GitHub issue for Beacon.

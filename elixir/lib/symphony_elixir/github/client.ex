@@ -107,6 +107,44 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  @spec create_issue(String.t(), String.t(), String.t(), [String.t()]) :: {:ok, map()} | {:error, term()}
+  def create_issue(repo_id, title, body, labels \\ []) when is_binary(repo_id) and is_binary(title) and is_binary(body) do
+    repo_config = repo_config_by_id(repo_id)
+
+    gh_api(
+      repo_config,
+      [
+        "repos/#{repo_config.owner}/#{repo_config.name}/issues",
+        "-X",
+        "POST",
+        "-f",
+        "title=#{title}",
+        "-f",
+        "body=#{body}"
+      ] ++ label_args(labels)
+    )
+  end
+
+  @spec publish_approved_plan(String.t(), map()) :: :ok | {:error, term()}
+  def publish_approved_plan(issue_id, manifest) when is_binary(issue_id) and is_map(manifest) do
+    body =
+      [
+        "## Autonomous issue plan approved",
+        "",
+        Map.get(manifest, "summary") || "",
+        "",
+        "Acceptance criteria:",
+        approved_plan_bullets(Map.get(manifest, "acceptance_criteria")),
+        "",
+        "Test plan:",
+        approved_plan_bullets(Map.get(manifest, "test_plan"))
+      ]
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join("\n")
+
+    create_comment(issue_id, body)
+  end
+
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) when is_binary(issue_id) and is_binary(state_name) do
     {repo_config, issue_number} = repo_and_issue_number(issue_id)
@@ -338,6 +376,18 @@ defmodule SymphonyElixir.GitHub.Client do
       :ok
     end
   end
+
+  defp label_args(labels) when is_list(labels) do
+    Enum.flat_map(labels, fn label ->
+      label = to_string(label)
+      if String.trim(label) == "", do: [], else: ["-f", "labels[]=#{label}"]
+    end)
+  end
+
+  defp label_args(_labels), do: []
+
+  defp approved_plan_bullets(values) when is_list(values), do: Enum.map_join(values, "\n", &("- " <> to_string(&1)))
+  defp approved_plan_bullets(_values), do: "- (none)"
 
   defp normalize_issue(repo_config, %{"number" => number, "title" => title} = issue) do
     labels = label_names(issue)
@@ -930,6 +980,10 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp primary_repo! do
     Config.primary_repo() || %{id: "github", owner: Config.settings!().tracker.owner, name: Config.settings!().tracker.repo, labels: %{}}
+  end
+
+  defp repo_config_by_id(repo_id) when is_binary(repo_id) do
+    Config.repo_by_id(repo_id) || primary_repo!()
   end
 
   defp repo_config_for_issue(%Issue{repo_id: repo_id, repo_owner: owner, repo_name: name}) do

@@ -7,9 +7,13 @@ This fork's local trusted path treats Symphony as a durable coding-agent session
 executor keeps full repo access, while optional evidence bundles can be reviewed by a separate
 review agent before the issue parks at human review. The GitHub cockpit path also separates builder
 and reviewer identities so autonomous review checks can gate merge readiness without handing App
-credentials to the coding agents. Codex app-server is the first/default adapter; the controller
-contract is intentionally phrased around coding agents so other local agents can be added without
-changing the lifecycle model.
+credentials to the coding agents. Codex app-server remains the default adapter, and the Elixir
+implementation can also select a local Claude Code provider per repository without changing the
+lifecycle model.
+
+The newer task planning lane adds local goal intake before GitHub issue creation: Symphony can plan
+from a native goal, ask for concise input, wait for structured approval, then create/link the issue
+and hand it to independently routed planner, executor, and reviewer profiles.
 
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](.github/media/symphony-demo.mp4)
 

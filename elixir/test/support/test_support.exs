@@ -72,6 +72,14 @@ defmodule SymphonyElixir.TestSupport do
   def restore_env(key, value), do: System.put_env(key, value)
 
   def stop_default_http_server do
+    if is_nil(Process.whereis(SymphonyElixir.Supervisor)) do
+      :ok
+    else
+      stop_default_http_server_child()
+    end
+  end
+
+  defp stop_default_http_server_child do
     case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
            {SymphonyElixir.HttpServer, _pid, _type, _modules} -> true
            _child -> false
@@ -125,6 +133,9 @@ defmodule SymphonyElixir.TestSupport do
           max_tokens_before_first_artifact: 200_000,
           max_tokens_without_artifact: 250_000,
           max_concurrent_agents_by_state: %{},
+          agent_default_provider: "codex",
+          agent_profiles: %{},
+          agent_routes: [],
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
@@ -133,6 +144,11 @@ defmodule SymphonyElixir.TestSupport do
           codex_semantic_inactivity_timeout_ms: 1_800_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          claude_code_command: "claude",
+          claude_code_model: nil,
+          claude_code_permission_mode: "bypassPermissions",
+          claude_code_setting_sources: "user,project,local",
+          claude_code_extra_args: [],
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -184,6 +200,9 @@ defmodule SymphonyElixir.TestSupport do
     max_tokens_before_first_artifact = Keyword.get(config, :max_tokens_before_first_artifact)
     max_tokens_without_artifact = Keyword.get(config, :max_tokens_without_artifact)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
+    agent_default_provider = Keyword.get(config, :agent_default_provider)
+    agent_profiles = Keyword.get(config, :agent_profiles)
+    agent_routes = Keyword.get(config, :agent_routes)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -192,6 +211,11 @@ defmodule SymphonyElixir.TestSupport do
     codex_semantic_inactivity_timeout_ms = Keyword.get(config, :codex_semantic_inactivity_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    claude_code_command = Keyword.get(config, :claude_code_command)
+    claude_code_model = Keyword.get(config, :claude_code_model)
+    claude_code_permission_mode = Keyword.get(config, :claude_code_permission_mode)
+    claude_code_setting_sources = Keyword.get(config, :claude_code_setting_sources)
+    claude_code_extra_args = Keyword.get(config, :claude_code_extra_args)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -239,6 +263,9 @@ defmodule SymphonyElixir.TestSupport do
         "  root: #{yaml_value(workspace_root)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
+        "  default_provider: #{yaml_value(agent_default_provider)}",
+        "  profiles: #{yaml_value(agent_profiles)}",
+        "  routes: #{yaml_value(agent_routes)}",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
@@ -256,6 +283,13 @@ defmodule SymphonyElixir.TestSupport do
         "  semantic_inactivity_timeout_ms: #{yaml_value(codex_semantic_inactivity_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        claude_code_yaml(
+          claude_code_command,
+          claude_code_model,
+          claude_code_permission_mode,
+          claude_code_setting_sources,
+          claude_code_extra_args
+        ),
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         evidence_yaml(
@@ -286,6 +320,7 @@ defmodule SymphonyElixir.TestSupport do
           "    name: #{yaml_value(Map.get(repo, :name) || Map.get(repo, "name"))}",
           "    clone_url: #{yaml_value(Map.get(repo, :clone_url) || Map.get(repo, "clone_url"))}",
           "    workspace_root: #{yaml_value(Map.get(repo, :workspace_root) || Map.get(repo, "workspace_root"))}",
+          "    agent_provider: #{yaml_value(Map.get(repo, :agent_provider) || Map.get(repo, "agent_provider"))}",
           "    labels: #{yaml_value(Map.get(repo, :labels) || Map.get(repo, "labels") || %{})}"
         ]
       end)
@@ -316,6 +351,18 @@ defmodule SymphonyElixir.TestSupport do
       "    installation_id: #{yaml_value(Map.get(app, :installation_id) || Map.get(app, "installation_id"))}",
       "    private_key: #{yaml_value(Map.get(app, :private_key) || Map.get(app, "private_key"))}",
       "    private_key_path: #{yaml_value(Map.get(app, :private_key_path) || Map.get(app, "private_key_path"))}"
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp claude_code_yaml(command, model, permission_mode, setting_sources, extra_args) do
+    [
+      "claude_code:",
+      "  command: #{yaml_value(command)}",
+      "  model: #{yaml_value(model)}",
+      "  permission_mode: #{yaml_value(permission_mode)}",
+      "  setting_sources: #{yaml_value(setting_sources)}",
+      "  extra_args: #{yaml_value(extra_args)}"
     ]
     |> Enum.join("\n")
   end

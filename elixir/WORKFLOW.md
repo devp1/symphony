@@ -31,6 +31,7 @@ repos:
     owner: devp1
     name: Beacon
     clone_url: https://github.com/devp1/Beacon.git
+    agent_provider: codex
     labels:
       queued: agent-ready
       running: in-progress
@@ -64,6 +65,28 @@ hooks:
   before_remove: |
     git status --short
 agent:
+  default_provider: codex
+  profiles:
+    planner:
+      provider: codex
+    executor:
+      provider: codex
+    reviewer:
+      provider: codex
+  routes:
+    - labels: [claude-dogfood]
+      planner:
+        provider: claude_code
+        model: sonnet
+        effort: medium
+        permission_mode: plan
+      executor:
+        provider: claude_code
+        model: sonnet
+        effort: high
+        permission_mode: bypassPermissions
+      reviewer:
+        provider: codex
   max_concurrent_agents: 10
   max_turns: 20
   artifact_nudge_tokens: 150000
@@ -83,6 +106,11 @@ codex:
   approval_policy: never
   thread_sandbox: danger-full-access
   semantic_inactivity_timeout_ms: 1800000
+claude_code:
+  command: claude
+  permission_mode: bypassPermissions
+  setting_sources: user,project,local
+  extra_args: []
 storage:
   sqlite_path: ./symphony.sqlite3
 ---

@@ -119,6 +119,34 @@ defmodule SymphonyElixir.Storage do
           optional(:output_path) => String.t() | nil
         }
 
+  @type task_run_attrs :: %{
+          optional(:id) => String.t(),
+          optional(:source) => String.t(),
+          optional(:repo_id) => String.t() | nil,
+          optional(:issue_number) => integer() | nil,
+          optional(:issue_identifier) => String.t() | nil,
+          optional(:issue_title) => String.t() | nil,
+          optional(:issue_url) => String.t() | nil,
+          optional(:goal_text) => String.t() | nil,
+          optional(:repo_hint) => String.t() | nil,
+          optional(:labels) => [String.t()] | nil,
+          optional(:creator_notes) => String.t() | nil,
+          optional(:state) => String.t(),
+          optional(:outcome) => String.t() | nil,
+          optional(:planning_manifest) => term(),
+          optional(:approved_plan) => term(),
+          optional(:implementation_manifest) => term(),
+          optional(:review_manifest) => term(),
+          optional(:questions) => term(),
+          optional(:answers) => term(),
+          optional(:agent_profiles) => term(),
+          optional(:branch_name) => String.t() | nil,
+          optional(:pr_url) => String.t() | nil,
+          optional(:pr_number) => integer() | nil,
+          optional(:current_step) => String.t() | nil,
+          optional(:error) => String.t() | nil
+        }
+
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     name = Keyword.get(opts, :name, __MODULE__)
@@ -186,6 +214,17 @@ defmodule SymphonyElixir.Storage do
 
   @spec record_autonomous_review(autonomous_review_attrs()) :: {:ok, String.t()} | {:error, term()}
   def record_autonomous_review(attrs), do: call_or_direct({:record_autonomous_review, attrs})
+
+  @spec create_task_run(task_run_attrs()) :: {:ok, String.t()} | {:error, term()}
+  def create_task_run(attrs), do: call_or_direct({:create_task_run, attrs})
+
+  @spec update_task_run(String.t(), task_run_attrs()) :: :ok | {:error, term()}
+  def update_task_run(task_run_id, attrs), do: call_or_direct({:update_task_run, task_run_id, attrs})
+
+  @spec append_task_event(String.t(), String.t(), String.t(), term()) :: :ok | {:error, term()}
+  def append_task_event(task_run_id, level, message, data \\ nil) do
+    call_or_direct({:append_task_event, task_run_id, level, message, data})
+  end
 
   @spec list_evidence_bundles(non_neg_integer()) :: [map()]
   def list_evidence_bundles(limit \\ 50) when is_integer(limit) and limit >= 0 do
@@ -257,6 +296,45 @@ defmodule SymphonyElixir.Storage do
     order by updated_at desc
     """)
   end
+
+  @spec list_task_runs(non_neg_integer()) :: [map()]
+  def list_task_runs(limit \\ 50) when is_integer(limit) and limit >= 0 do
+    query_json("""
+    select *
+    from task_runs
+    order by updated_at desc
+    limit #{limit}
+    """)
+  end
+
+  @spec get_task_run(String.t()) :: map() | nil
+  def get_task_run(task_run_id) when is_binary(task_run_id) do
+    case query_json("select * from task_runs where id = #{sql_quote(task_run_id)} limit 1") do
+      [task_run] ->
+        task_run
+        |> Map.put("events", task_events(task_run_id))
+
+      _ ->
+        nil
+    end
+  end
+
+  @spec get_task_run_by_issue(String.t() | nil, integer() | nil) :: map() | nil
+  def get_task_run_by_issue(repo_id, issue_number) when is_binary(repo_id) and is_integer(issue_number) do
+    case query_json("""
+         select *
+         from task_runs
+         where repo_id = #{sql_quote(repo_id)}
+           and issue_number = #{integer(issue_number)}
+         order by updated_at desc
+         limit 1
+         """) do
+      [%{"id" => id}] -> get_task_run(id)
+      _ -> nil
+    end
+  end
+
+  def get_task_run_by_issue(_repo_id, _issue_number), do: nil
 
   @spec get_run(String.t()) :: map() | nil
   def get_run(run_id) when is_binary(run_id) do
@@ -364,6 +442,24 @@ defmodule SymphonyElixir.Storage do
     {:reply, do_record_autonomous_review(path, attrs), state}
   end
 
+  def handle_call({:create_task_run, attrs}, _from, state) do
+    path = sqlite_path()
+    _ = migrate(path)
+    {:reply, do_create_task_run(path, attrs), state}
+  end
+
+  def handle_call({:update_task_run, task_run_id, attrs}, _from, state) do
+    path = sqlite_path()
+    _ = migrate(path)
+    {:reply, do_update_task_run(path, task_run_id, attrs), state}
+  end
+
+  def handle_call({:append_task_event, task_run_id, level, message, data}, _from, state) do
+    path = sqlite_path()
+    _ = migrate(path)
+    {:reply, do_append_task_event(path, task_run_id, level, message, data), state}
+  end
+
   defp call_or_direct(message) do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) -> GenServer.call(pid, message)
@@ -395,6 +491,12 @@ defmodule SymphonyElixir.Storage do
   defp direct(path, {:upsert_evidence_bundle, attrs}), do: do_upsert_evidence_bundle(path, attrs)
   defp direct(path, {:record_evidence_review, attrs}), do: do_record_evidence_review(path, attrs)
   defp direct(path, {:record_autonomous_review, attrs}), do: do_record_autonomous_review(path, attrs)
+  defp direct(path, {:create_task_run, attrs}), do: do_create_task_run(path, attrs)
+  defp direct(path, {:update_task_run, task_run_id, attrs}), do: do_update_task_run(path, task_run_id, attrs)
+
+  defp direct(path, {:append_task_event, task_run_id, level, message, data}) do
+    do_append_task_event(path, task_run_id, level, message, data)
+  end
 
   defp migrate(path) do
     sql = """
@@ -529,6 +631,43 @@ defmodule SymphonyElixir.Storage do
       stale integer not null,
       output_path text,
       created_at text not null
+    );
+    create table if not exists task_runs (
+      id text primary key,
+      source text not null,
+      repo_id text,
+      issue_number integer,
+      issue_identifier text,
+      issue_title text,
+      issue_url text,
+      goal_text text,
+      repo_hint text,
+      labels_json text not null,
+      creator_notes text,
+      state text not null,
+      outcome text,
+      planning_manifest_json text,
+      approved_plan_json text,
+      implementation_manifest_json text,
+      review_manifest_json text,
+      questions_json text,
+      answers_json text,
+      agent_profiles_json text,
+      branch_name text,
+      pr_url text,
+      pr_number integer,
+      current_step text,
+      error text,
+      created_at text not null,
+      updated_at text not null
+    );
+    create table if not exists task_events (
+      id integer primary key autoincrement,
+      task_run_id text not null,
+      level text not null,
+      message text not null,
+      data_json text,
+      inserted_at text not null
     );
     """
 
@@ -814,6 +953,137 @@ defmodule SymphonyElixir.Storage do
     end
   end
 
+  defp do_create_task_run(path, attrs) do
+    now = timestamp()
+    id = attrs[:id] || "task-run-" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+    case exec(path, task_run_insert_sql(id, attrs, now)) do
+      :ok -> {:ok, id}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp task_run_insert_sql(id, attrs, now) do
+    """
+    insert into task_runs(#{Enum.join(task_run_insert_columns(), ", ")})
+    values (#{Enum.join(task_run_insert_values(id, attrs, now), ", ")});
+    """
+  end
+
+  defp task_run_insert_columns do
+    [
+      "id",
+      "source",
+      "repo_id",
+      "issue_number",
+      "issue_identifier",
+      "issue_title",
+      "issue_url",
+      "goal_text",
+      "repo_hint",
+      "labels_json",
+      "creator_notes",
+      "state",
+      "outcome",
+      "planning_manifest_json",
+      "approved_plan_json",
+      "implementation_manifest_json",
+      "review_manifest_json",
+      "questions_json",
+      "answers_json",
+      "agent_profiles_json",
+      "branch_name",
+      "pr_url",
+      "pr_number",
+      "current_step",
+      "error",
+      "created_at",
+      "updated_at"
+    ]
+  end
+
+  defp task_run_insert_values(id, attrs, now) do
+    [
+      sql_quote(id),
+      sql_quote(attrs[:source] || "goal"),
+      sql_quote(attrs[:repo_id]),
+      integer(attrs[:issue_number]),
+      sql_quote(attrs[:issue_identifier]),
+      sql_quote(attrs[:issue_title]),
+      sql_quote(attrs[:issue_url]),
+      sql_quote(attrs[:goal_text]),
+      sql_quote(attrs[:repo_hint]),
+      json(attrs[:labels] || []),
+      sql_quote(attrs[:creator_notes]),
+      sql_quote(attrs[:state] || "planning_queued"),
+      sql_quote(attrs[:outcome]),
+      json(attrs[:planning_manifest]),
+      json(attrs[:approved_plan]),
+      json(attrs[:implementation_manifest]),
+      json(attrs[:review_manifest]),
+      json(attrs[:questions] || []),
+      json(attrs[:answers] || []),
+      json(attrs[:agent_profiles] || %{}),
+      sql_quote(attrs[:branch_name]),
+      sql_quote(attrs[:pr_url]),
+      integer(attrs[:pr_number]),
+      sql_quote(attrs[:current_step] || "planning queued"),
+      sql_quote(attrs[:error]),
+      sql_quote(now),
+      sql_quote(now)
+    ]
+  end
+
+  defp do_update_task_run(path, task_run_id, attrs) do
+    assignments =
+      attrs
+      |> Map.take([
+        :source,
+        :repo_id,
+        :issue_number,
+        :issue_identifier,
+        :issue_title,
+        :issue_url,
+        :goal_text,
+        :repo_hint,
+        :labels,
+        :creator_notes,
+        :state,
+        :outcome,
+        :planning_manifest,
+        :approved_plan,
+        :implementation_manifest,
+        :review_manifest,
+        :questions,
+        :answers,
+        :agent_profiles,
+        :branch_name,
+        :pr_url,
+        :pr_number,
+        :current_step,
+        :error
+      ])
+      |> Enum.map(&task_run_assignment/1)
+
+    case assignments do
+      [] ->
+        :ok
+
+      assignments ->
+        exec(
+          path,
+          "update task_runs set #{Enum.join(assignments, ", ")}, updated_at = #{sql_quote(timestamp())} where id = #{sql_quote(task_run_id)};"
+        )
+    end
+  end
+
+  defp do_append_task_event(path, task_run_id, level, message, data) do
+    exec(path, """
+    insert into task_events(task_run_id, level, message, data_json, inserted_at)
+    values (#{sql_quote(task_run_id)}, #{sql_quote(level)}, #{sql_quote(message)}, #{json(data)}, #{sql_quote(timestamp())});
+    """)
+  end
+
   defp run_events(run_id) do
     query_json("""
     select *
@@ -859,6 +1129,15 @@ defmodule SymphonyElixir.Storage do
     """)
   end
 
+  defp task_events(task_run_id) do
+    query_json("""
+    select *
+    from task_events
+    where task_run_id = #{sql_quote(task_run_id)}
+    order by id
+    """)
+  end
+
   defp query_json(sql) do
     path = sqlite_path()
     _ = migrate(path)
@@ -901,6 +1180,18 @@ defmodule SymphonyElixir.Storage do
 
   defp issue_session_assignment({:health, value}), do: "health_json = #{json(value || [])}"
   defp issue_session_assignment({key, value}), do: "#{key} = #{sql_quote(value)}"
+
+  defp task_run_assignment({:labels, value}), do: "labels_json = #{json(value || [])}"
+  defp task_run_assignment({:planning_manifest, value}), do: "planning_manifest_json = #{json(value)}"
+  defp task_run_assignment({:approved_plan, value}), do: "approved_plan_json = #{json(value)}"
+  defp task_run_assignment({:implementation_manifest, value}), do: "implementation_manifest_json = #{json(value)}"
+  defp task_run_assignment({:review_manifest, value}), do: "review_manifest_json = #{json(value)}"
+  defp task_run_assignment({:questions, value}), do: "questions_json = #{json(value || [])}"
+  defp task_run_assignment({:answers, value}), do: "answers_json = #{json(value || [])}"
+  defp task_run_assignment({:agent_profiles, value}), do: "agent_profiles_json = #{json(value || %{})}"
+  defp task_run_assignment({:pr_number, value}), do: "pr_number = #{integer(value)}"
+  defp task_run_assignment({:issue_number, value}), do: "issue_number = #{integer(value)}"
+  defp task_run_assignment({key, value}), do: "#{key} = #{sql_quote(value)}"
 
   defp exec(path, sql) do
     File.mkdir_p!(Path.dirname(path))

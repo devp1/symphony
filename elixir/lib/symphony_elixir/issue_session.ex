@@ -12,7 +12,7 @@ defmodule SymphonyElixir.IssueSession do
   require Logger
 
   alias SymphonyElixir.{AutonomousReview, CodingAgent, Config, Evidence, Handoff, Linear.Issue, PromptBuilder}
-  alias SymphonyElixir.{Storage, Tracker, Workpad, Workspace}
+  alias SymphonyElixir.{Storage, TaskRuns, Tracker, Workpad, Workspace}
 
   @handoff_review_heartbeat_ms if Mix.env() == :test, do: 50, else: 30_000
 
@@ -318,7 +318,12 @@ defmodule SymphonyElixir.IssueSession do
   defp ensure_app_session(%{app_session: %{} = _app_session} = state), do: {:ok, state}
 
   defp ensure_app_session(%{workspace: workspace, worker_host: worker_host} = state) do
+    agent_profile = Config.agent_profile_for_issue(state.issue, :executor)
+    agent_provider = agent_profile.provider
+
     case CodingAgent.start_session(:executor, workspace,
+           agent_provider: agent_provider,
+           agent_profile: agent_profile,
            worker_host: worker_host,
            resume_thread_id: Keyword.get(state.opts, :resume_thread_id)
          ) do
@@ -391,6 +396,8 @@ defmodule SymphonyElixir.IssueSession do
     prompt = build_turn_prompt(state.issue, state.opts, state.cycle_kind, turn_number, max_turns)
 
     case CodingAgent.run_turn(:executor, app_session, prompt, state.issue,
+           agent_provider: Map.get(app_session, :agent_provider) || Config.agent_provider_for_issue(state.issue),
+           agent_profile: Map.get(app_session, :agent_profile) || Config.agent_profile_for_issue(state.issue, :executor),
            on_message: codex_message_handler(state.recipient, state.issue),
            turn_interrupt_sentinel: handoff_interrupt_sentinel(state)
          ) do
@@ -519,6 +526,8 @@ defmodule SymphonyElixir.IssueSession do
           observed_state: refreshed_issue.state,
           handoff: payload
         })
+
+      _ = TaskRuns.sync_issue_execution(refreshed_issue, state.run_id)
 
       {:ok, %{state | issue: refreshed_issue}}
     else
@@ -1405,7 +1414,7 @@ defmodule SymphonyElixir.IssueSession do
   defp send_session_state_update(_recipient, _issue, _update), do: :ok
 
   defp stop_app_session(%{app_session: %{} = app_session} = state) do
-    CodingAgent.stop_session(:executor, app_session)
+    CodingAgent.stop_session(:executor, app_session, agent_provider: Map.get(app_session, :agent_provider))
     %{state | app_session: nil}
   end
 

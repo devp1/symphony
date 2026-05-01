@@ -6,7 +6,11 @@ defmodule SymphonyElixir.CoreTest do
 
     @impl true
     def run(role, workspace, prompt, issue, opts) do
-      send(Keyword.fetch!(opts, :test_pid), {:coding_agent_adapter_run, role, workspace, prompt, issue.identifier})
+      send(
+        Keyword.fetch!(opts, :test_pid),
+        {:coding_agent_adapter_run, role, workspace, prompt, issue.identifier, Keyword.get(opts, :agent_profile)}
+      )
+
       maybe_write_autonomous_review(prompt, opts)
       {:ok, %{session_id: "fake-session", thread_id: "fake-thread"}}
     end
@@ -70,6 +74,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.github.reviewer_token == nil
     assert config.github.review_check_name == "symphony/autonomous-review"
     assert config.github.required_check_names == []
+    assert config.agent.default_provider == "codex"
     assert config.agent.max_turns == 20
     assert config.agent.artifact_nudge_tokens == 250_000
     assert config.agent.max_artifact_nudges == 1
@@ -80,6 +85,15 @@ defmodule SymphonyElixir.CoreTest do
     assert config.evidence.skip_labels == ["evidence-skip"]
     assert config.evidence.review_gate == "blocking"
     assert config.evidence.max_review_attempts == 2
+    assert config.claude_code.command == "claude"
+    assert config.claude_code.model == nil
+    assert config.claude_code.permission_mode == "bypassPermissions"
+    assert config.claude_code.setting_sources == "user,project,local"
+    assert config.claude_code.extra_args == []
+
+    assert Config.agent_profile_for_issue(%Issue{id: "issue-1", identifier: "GH-1"}, :planner) == %{provider: "codex"}
+    assert Config.agent_profile_for_issue(%Issue{id: "issue-1", identifier: "GH-1"}, :executor) == %{provider: "codex"}
+    assert Config.agent_profile_for_issue(%Issue{id: "issue-1", identifier: "GH-1"}, :reviewer) == %{provider: "codex"}
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -99,6 +113,67 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(), agent_default_provider: "claude_code")
+    assert Config.settings!().agent.default_provider == "claude_code"
+    assert Config.agent_provider_for_issue(%Issue{id: "issue-1", identifier: "GH-1"}) == "claude_code"
+
+    write_workflow_file!(Workflow.workflow_file_path(), agent_default_provider: "nope")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.default_provider"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_profiles: %{
+        planner: %{provider: "claude_code", model: "sonnet"},
+        reviewer: %{provider: "codex", model: "gpt-5.4"}
+      },
+      agent_routes: [
+        %{
+          labels: ["claude-dogfood"],
+          executor: %{provider: "claude_code", model: "opus", effort: "high"},
+          reviewer: %{provider: "claude_code", model: "sonnet"}
+        }
+      ]
+    )
+
+    routed_issue = %Issue{id: "issue-2", identifier: "GH-2", labels: ["claude-dogfood"]}
+    plain_issue = %Issue{id: "issue-3", identifier: "GH-3", labels: ["docs"]}
+
+    assert Config.agent_profile_for_issue(routed_issue, :planner) == %{provider: "claude_code", model: "sonnet"}
+
+    assert Config.agent_profile_for_issue(routed_issue, :executor) == %{
+             provider: "claude_code",
+             model: "opus",
+             effort: "high"
+           }
+
+    assert Config.agent_provider_for_issue(routed_issue) == "claude_code"
+    assert Config.agent_provider_for_issue(plain_issue) == "codex"
+    assert Config.agent_profile_for_issue(routed_issue, :reviewer) == %{provider: "claude_code", model: "sonnet"}
+    assert Config.agent_profile_for_issue(plain_issue, :executor) == %{provider: "codex"}
+    assert Config.agent_profile_for_issue(plain_issue, :reviewer) == %{provider: "codex", model: "gpt-5.4"}
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_profiles: %{planner: %{provider: "not-real"}}
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "profiles.planner.provider"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      claude_code_command: "/opt/bin/claude",
+      claude_code_model: "sonnet",
+      claude_code_permission_mode: "acceptEdits",
+      claude_code_setting_sources: "user",
+      claude_code_extra_args: ["--include-partial-messages", " ", "--debug"]
+    )
+
+    config = Config.settings!()
+    assert config.claude_code.command == "/opt/bin/claude"
+    assert config.claude_code.model == "sonnet"
+    assert config.claude_code.permission_mode == "acceptEdits"
+    assert config.claude_code.setting_sources == "user"
+    assert config.claude_code.extra_args == ["--include-partial-messages", "--debug"]
 
     write_workflow_file!(Workflow.workflow_file_path(), artifact_nudge_tokens: 0)
     assert Config.settings!().agent.artifact_nudge_tokens == 0
@@ -284,7 +359,7 @@ defmodule SymphonyElixir.CoreTest do
                test_pid: self()
              )
 
-    assert_receive {:coding_agent_adapter_run, :reviewer, "/tmp/workspace", "review evidence", "GH-1"}
+    assert_receive {:coding_agent_adapter_run, :reviewer, "/tmp/workspace", "review evidence", "GH-1", %{provider: "codex"}}
 
     assert {:ok, session} =
              SymphonyElixir.CodingAgent.start_session(:executor, "/tmp/workspace",
@@ -310,11 +385,13 @@ defmodule SymphonyElixir.CoreTest do
 
     assert_receive {:coding_agent_stop_session, :executor, "fake-thread"}
 
-    assert {:error, {:unsupported_agent_role, :planner}} =
+    assert {:ok, %{session_id: "fake-session", thread_id: "fake-thread"}} =
              SymphonyElixir.CodingAgent.run(:planner, "/tmp/workspace", "plan", issue,
                adapter: FakeCodingAgentAdapter,
                test_pid: self()
              )
+
+    assert_receive {:coding_agent_adapter_run, :planner, "/tmp/workspace", "plan", "GH-1", %{provider: "codex"}}
   end
 
   test "autonomous review normalizes verdicts and gates merge readiness" do
@@ -460,7 +537,7 @@ defmodule SymphonyElixir.CoreTest do
       assert review.head_sha == "abc123"
       assert File.regular?(review.output_path)
 
-      assert_receive {:coding_agent_adapter_run, :reviewer, ^workspace, prompt, "GH-25-autonomous-review"}
+      assert_receive {:coding_agent_adapter_run, :reviewer, ^workspace, prompt, "GH-25-autonomous-review", %{provider: "codex"}}
       assert prompt =~ "Autonomous PR review contract"
       assert prompt =~ "https://github.com/devp1/Beacon/pull/25"
 
@@ -713,7 +790,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_kind: "github",
       workspace_root: workspace_root,
       repos: [
-        %{id: "beacon", owner: "devp1", name: "Beacon", labels: %{queued: "agent-ready"}},
+        %{id: "beacon", owner: "devp1", name: "Beacon", agent_provider: "codex", labels: %{queued: "agent-ready"}},
         %{owner: "openai", name: "symphony", workspace_root: "$SYMPHONY_TEST_REPO_ROOT"}
       ]
     )
@@ -726,8 +803,8 @@ defmodule SymphonyElixir.CoreTest do
       tracker_kind: "github",
       workspace_root: workspace_root,
       repos: [
-        %{id: "beacon", owner: "devp1", name: "Beacon", labels: %{queued: "agent-ready"}},
-        %{owner: "openai", name: "symphony", workspace_root: "$SYMPHONY_TEST_REPO_ROOT"}
+        %{id: "beacon", owner: "devp1", name: "Beacon", agent_provider: "codex", labels: %{queued: "agent-ready"}},
+        %{owner: "openai", name: "symphony", agent_provider: "claude_code", workspace_root: "$SYMPHONY_TEST_REPO_ROOT"}
       ]
     )
 
@@ -737,11 +814,26 @@ defmodule SymphonyElixir.CoreTest do
     assert beacon.id == "beacon"
     assert beacon.clone_url == "https://github.com/devp1/Beacon.git"
     assert beacon.workspace_root == Path.join(workspace_root, "beacon")
+    assert beacon.agent_provider == "codex"
     assert beacon.labels["managed"] == "symphony"
     assert beacon.labels["queued"] == "agent-ready"
 
     assert symphony.id == "openai-symphony"
+    assert symphony.agent_provider == "claude_code"
     assert symphony.workspace_root == Path.join(workspace_root, "custom-symphony")
+    assert Config.agent_provider_for_issue(%Issue{repo_id: "beacon"}) == "codex"
+    assert Config.agent_provider_for_issue(%Issue{repo_id: "openai-symphony"}) == "claude_code"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      workspace_root: workspace_root,
+      repos: [
+        %{id: "beacon", owner: "devp1", name: "Beacon", agent_provider: "nope"}
+      ]
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "repos.agent_provider"
   end
 
   test "sqlite storage persists repos, issue snapshots, runs, events, and artifacts" do
